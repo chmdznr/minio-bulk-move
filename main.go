@@ -112,6 +112,10 @@ func main() {
 	}
 	defer db.Close()
 
+	// Check database schema and counts
+	log.Printf("Checking database %s...", config.dbFile)
+	checkDatabase(db)
+
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -200,6 +204,9 @@ func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan
 			ORDER BY id
 			LIMIT ? OFFSET ?`
 
+		// Debug: Print query and parameters
+		log.Printf("Running query with project_name=%s, limit=%d, offset=%d", config.projectName, config.batchSize, offset)
+
 		rows, err := db.QueryContext(ctx, query, config.projectName, config.batchSize, offset)
 		if err != nil {
 			log.Printf("Error querying database: %v", err)
@@ -218,6 +225,9 @@ func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan
 				stats.errCount.Add(1)
 				continue
 			}
+
+			// Debug: Print row data
+			log.Printf("Found record: id_file=%s, filepath=%s, metadata=%s", idFile, filepath, metadataStr)
 
 			// Parse metadata
 			var metadata FileMetadata
@@ -259,7 +269,12 @@ func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan
 		}
 		rows.Close()
 
+		// Debug: Print batch results
+		log.Printf("Batch completed: found %d records", batchCount)
+
 		if empty {
+			// Debug: Print when no more records
+			log.Printf("No more records found, exiting")
 			break
 		}
 
@@ -328,6 +343,43 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 
 			stats.processedObjects.Add(1)
 		}
+	}
+}
+
+func checkDatabase(db *sql.DB) {
+	// Check table schema
+	rows, err := db.Query("SELECT sql FROM sqlite_master WHERE type='table' AND name='files'")
+	if err != nil {
+		log.Printf("Error checking table schema: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var tableSQL string
+		if err := rows.Scan(&tableSQL); err != nil {
+			log.Printf("Error reading table schema: %v", err)
+		} else {
+			log.Printf("Table schema: %s", tableSQL)
+		}
+	}
+
+	// Get total count and project names
+	rows, err = db.Query("SELECT project_name, status, COUNT(*) FROM files GROUP BY project_name, status")
+	if err != nil {
+		log.Printf("Error getting file counts: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var projectName, status string
+		var count int
+		if err := rows.Scan(&projectName, &status, &count); err != nil {
+			log.Printf("Error reading count: %v", err)
+			continue
+		}
+		log.Printf("Project: %s, Status: %s, Count: %d", projectName, status, count)
 	}
 }
 
