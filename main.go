@@ -575,11 +575,11 @@ show_progress() {
     if [ $elapsed -eq 0 ]; then
         elapsed=1
     fi
-    rate=$(bc <<< "scale=2; $processed_files / $elapsed")
+    rate=$((processed_files / elapsed))
     
     # Calculate ETA
     remaining_files=$((total_files - processed_files))
-    if [ $rate != "0" ]; then
+    if [ $rate -gt 0 ]; then
         eta=$((remaining_files / rate))
         eta_formatted=$(date -u -d @$eta '+%H:%M:%S')
     else
@@ -627,12 +627,11 @@ handle_error() {
 		sourceKey := path.Join(config.sourceFolder, idFile)
 
 		// Generate mc command with error handling and progress tracking
-		cmd := fmt.Sprintf(`mc rm --versions --force %s/%s/%s || handle_error "%s"
+		cmd := fmt.Sprintf(`mc rm --versions --force "%s/%s" || handle_error "%s"
 ((processed_files++))
 show_progress
 `, 
-			config.bucket, // This should be the mc alias for the MinIO server
-			bucket,
+			bucket, // This should be the mc alias for the MinIO server
 			sourceKey,
 			sourceKey)
 		
@@ -657,7 +656,8 @@ echo "See cleanup_errors.log for any errors"
 	fmt.Printf("Total objects to cleanup: %d\n\n", totalCount)
 	fmt.Println("To perform cleanup:")
 	fmt.Println("1. Review the generated script")
-	fmt.Println("2. Configure mc with your MinIO credentials")
+	fmt.Println("2. Configure mc with your MinIO credentials:")
+	fmt.Printf("   mc alias set %s %s %s %s\n", config.bucket, config.endpoint, config.accessKeyID, config.secretAccessKey)
 	fmt.Println("3. Run the script (it may take several hours)")
 	fmt.Printf("   bash %s\n\n", scriptFile)
 	fmt.Println("The script will:")
