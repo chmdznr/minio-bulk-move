@@ -10,6 +10,10 @@ A Go application for efficiently moving files in MinIO storage based on their ye
 - Year-based file filtering and organization
 - Detailed processing statistics
 - Support for MinIO S3-compatible storage
+- Prefix-based processing for efficient handling of large file sets
+- Configurable retry mechanism for resilient operations
+- Real-time progress tracking with current prefix display
+- Optimized HTTP transport settings for better performance
 
 ## Prerequisites
 
@@ -50,8 +54,9 @@ go build -o minio-bulk-move
 - `-bucket`: Source bucket name (required)
 - `-source-folder`: Source folder path in the bucket
 - `-base-year`: Base year for file filtering
-- `-workers`: Number of concurrent workers (default: 5)
+- `-workers`: Number of concurrent workers (default: 10)
 - `-batch-size`: Batch size for processing (default: 1000)
+- `-max-retries`: Maximum number of retries for operations (default: 3)
 
 ### Example
 
@@ -65,7 +70,8 @@ go build -o minio-bulk-move
   -source-folder path/to/files \
   -base-year 2023 \
   -workers 10 \
-  -batch-size 2000
+  -batch-size 1000 \
+  -max-retries 3
 
 # For Unix-like systems
 ./minio-bulk-move \
@@ -76,8 +82,30 @@ go build -o minio-bulk-move
   -source-folder path/to/files \
   -base-year 2023 \
   -workers 10 \
-  -batch-size 2000
+  -batch-size 1000 \
+  -max-retries 3
 ```
+
+## Performance Tips
+
+When dealing with massive file sets (millions of files):
+
+1. **Batch Size**: Adjust `-batch-size` based on your system's memory capacity. Lower values (500-1000) are safer but slower, higher values may be faster but use more memory.
+
+2. **Workers**: The `-workers` flag controls concurrent operations. Start with 10 and adjust based on:
+   - Available system resources
+   - Network capacity
+   - MinIO server capacity
+
+3. **Retries**: Use `-max-retries` to handle temporary failures. Default is 3, increase in unstable networks.
+
+4. **Memory Usage**: The tool processes files by year-month prefixes to manage memory efficiently.
+
+5. **Network**: Ensure stable network connection as the tool performs multiple operations:
+   - Listing objects
+   - Reading metadata
+   - Copying objects
+   - Removing original objects
 
 ## Dependencies
 
