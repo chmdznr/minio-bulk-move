@@ -2,13 +2,14 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/schollz/progressbar/v3"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Config struct {
@@ -26,17 +28,18 @@ type Config struct {
 	useSSL          bool
 	bucket          string
 	sourceFolder    string
-	baseYear        int
 	workers         int
 	batchSize       int
 	maxRetries      int
+	dbFile          string
+	projectName     string
 }
 
 type FileOp struct {
-	object    minio.ObjectInfo
 	sourceKey string
 	targetKey string
 	yearMonth string
+	metadata  map[string]string
 }
 
 type Stats struct {
@@ -44,7 +47,14 @@ type Stats struct {
 	processedObjects atomic.Int64
 	skippedCount     atomic.Int64
 	errCount         atomic.Int64
-	currentPrefix    string
+	currentBatch     string
+}
+
+type FileMetadata struct {
+	ExistingID string `json:"existing_id"`
+	IDProfile  string `json:"id_profile"`
+	NamaFile   string `json:"nama_file_asli"`
+	NamaModul  string `json:"nama_modul"`
 }
 
 func main() {
@@ -53,9 +63,9 @@ func main() {
 	// Initialize MinIO client with custom transport
 	customTransport := &http.Transport{
 		ResponseHeaderTimeout: 30 * time.Second,
-		IdleConnTimeout:       90 * time.Second,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:      90 * time.Second,
+		MaxIdleConns:         100,
+		MaxIdleConnsPerHost:  100,
 	}
 
 	minioClient, err := minio.New(config.endpoint, &minio.Options{
@@ -66,6 +76,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error initializing MinIO client: %v", err)
 	}
+
+	// Open SQLite database
+	db, err := sql.Open("sqlite3", config.dbFile)
+	if err != nil {
+		log.Fatalf("Error opening database: %v", err)
+	}
+	defer db.Close()
 
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
@@ -81,7 +98,7 @@ func main() {
 	var wg sync.WaitGroup
 
 	// Start progress tracking
-	fmt.Printf("Processing files for year %d in batches of %d...\n", config.baseYear, config.batchSize)
+	fmt.Printf("Processing files from database %s for project %s...\n", config.dbFile, config.projectName)
 
 	// Start workers
 	for i := 0; i < config.workers; i++ {
@@ -99,15 +116,15 @@ func main() {
 		progressbar.OptionSetPredictTime(true),
 	)
 
-	// Start object processing
+	// Start processing files from database
 	go func() {
 		defer close(workChan)
-		processObjectsByPrefix(ctx, minioClient, config, workChan, stats)
+		processFilesFromDB(ctx, db, config, workChan, stats)
 	}()
 
 	// Update progress
 	go func() {
-		lastPrefix := ""
+		lastBatch := ""
 		for {
 			select {
 			case <-ctx.Done():
@@ -115,11 +132,11 @@ func main() {
 			default:
 				processed := stats.processedObjects.Load()
 				total := stats.totalObjects.Load()
-				currentPrefix := stats.currentPrefix
+				currentBatch := stats.currentBatch
 
-				if currentPrefix != "" && currentPrefix != lastPrefix {
-					fmt.Printf("\nProcessing prefix: %s\n", currentPrefix)
-					lastPrefix = currentPrefix
+				if currentBatch != "" && currentBatch != lastBatch {
+					fmt.Printf("\nProcessing batch: %s\n", currentBatch)
+					lastBatch = currentBatch
 				}
 
 				if total > 0 {
@@ -136,116 +153,85 @@ func main() {
 
 	// Final progress update
 	bar.Finish()
-	fmt.Printf("\nSummary for year %d:\n", config.baseYear)
+	fmt.Printf("\nSummary:\n")
 	fmt.Printf("Processed: %d files\n", stats.processedObjects.Load())
 	fmt.Printf("Errors: %d\n", stats.errCount.Load())
-	fmt.Printf("Skipped: %d (different year or invalid format)\n", stats.skippedCount.Load())
+	fmt.Printf("Skipped: %d\n", stats.skippedCount.Load())
 }
 
-func generatePrefixes(baseYear int) []string {
-	var prefixes []string
-	for month := 1; month <= 12; month++ {
-		prefix := fmt.Sprintf("U-%d%02d", baseYear, month)
-		prefixes = append(prefixes, prefix)
-	}
-	return prefixes
-}
+func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan chan<- FileOp, stats *Stats) {
+	offset := 0
+	for {
+		query := `
+			SELECT id_file, filepath, f_metadata
+			FROM files
+			WHERE project_name = ? AND status = 'uploaded'
+			ORDER BY id
+			LIMIT ? OFFSET ?`
 
-func processObjectsByPrefix(ctx context.Context, minioClient *minio.Client, config Config,
-	workChan chan<- FileOp, stats *Stats) {
-
-	prefixes := generatePrefixes(config.baseYear)
-	re := regexp.MustCompile(`U-(\d{4})(\d{2})\d+`)
-
-	for _, prefix := range prefixes {
-		stats.currentPrefix = prefix
-		log.Printf("Starting prefix: %s", prefix)
-
-		var continuationToken string
-		for {
-			// Process batch with retries
-			var empty bool
-			var lastErr error
-
-			for attempts := 0; attempts < config.maxRetries; attempts++ {
-				if attempts > 0 {
-					log.Printf("Retry %d for prefix %s after error: %v", attempts, prefix, lastErr)
-					time.Sleep(time.Second * time.Duration(attempts*2))
-				}
-
-				empty = true
-				opts := minio.ListObjectsOptions{
-					Prefix:     path.Join(config.sourceFolder, prefix),
-					Recursive:  true,
-					MaxKeys:    config.batchSize,
-					StartAfter: continuationToken,
-				}
-
-				objects := minioClient.ListObjects(ctx, config.bucket, opts)
-
-				for object := range objects {
-					if object.Err != nil {
-						lastErr = object.Err
-						log.Printf("Error listing objects: %v", object.Err)
-						empty = false
-						break
-					}
-
-					empty = false
-					continuationToken = object.Key
-
-					matches := re.FindStringSubmatch(object.Key)
-					if len(matches) < 3 {
-						stats.skippedCount.Add(1)
-						continue
-					}
-
-					year := matches[1]
-					month := matches[2]
-
-					// Skip if year doesn't match base year
-					if year != fmt.Sprintf("%d", config.baseYear) {
-						stats.skippedCount.Add(1)
-						continue
-					}
-
-					yearMonth := year + month
-					targetKey := path.Join("download", yearMonth, path.Base(object.Key))
-
-					stats.totalObjects.Add(1)
-
-					select {
-					case <-ctx.Done():
-						return
-					case workChan <- FileOp{
-						object:    object,
-						sourceKey: object.Key,
-						targetKey: targetKey,
-						yearMonth: yearMonth,
-					}:
-					}
-				}
-
-				if lastErr == nil {
-					break // Success, exit retry loop
-				}
-			}
-
-			if lastErr != nil {
-				log.Printf("Failed to process prefix %s after %d attempts, skipping...", prefix, config.maxRetries)
-				stats.errCount.Add(1)
-				break
-			}
-
-			// If no objects were returned, we've reached the end of this prefix
-			if empty {
-				break
-			}
-
-			log.Printf("Processed batch for prefix %s up to: %s", prefix, continuationToken)
+		rows, err := db.QueryContext(ctx, query, config.projectName, config.batchSize, offset)
+		if err != nil {
+			log.Printf("Error querying database: %v", err)
+			return
 		}
 
-		log.Printf("Completed prefix: %s", prefix)
+		empty := true
+		batchCount := 0
+		for rows.Next() {
+			empty = false
+			batchCount++
+
+			var idFile, filepath, metadataStr string
+			if err := rows.Scan(&idFile, &filepath, &metadataStr); err != nil {
+				log.Printf("Error scanning row: %v", err)
+				stats.errCount.Add(1)
+				continue
+			}
+
+			// Parse metadata
+			var metadata FileMetadata
+			if err := json.Unmarshal([]byte(metadataStr), &metadata); err != nil {
+				log.Printf("Error parsing metadata for %s: %v", idFile, err)
+				stats.errCount.Add(1)
+				continue
+			}
+
+			// Extract year-month from idFile (format: U-YYYYMM...)
+			if len(idFile) < 9 {
+				log.Printf("Invalid id_file format: %s", idFile)
+				stats.skippedCount.Add(1)
+				continue
+			}
+
+			yearMonth := idFile[2:8] // Extract YYYYMM
+			targetKey := path.Join("download", yearMonth, path.Base(idFile))
+
+			stats.totalObjects.Add(1)
+			stats.currentBatch = fmt.Sprintf("Batch %d-%d", offset, offset+batchCount)
+
+			select {
+			case <-ctx.Done():
+				rows.Close()
+				return
+			case workChan <- FileOp{
+				sourceKey: idFile,
+				targetKey: targetKey,
+				yearMonth: yearMonth,
+				metadata: map[string]string{
+					"X-Amz-Meta-Original-Path": filepath,
+					"X-Amz-Meta-Module":        metadata.NamaModul,
+					"X-Amz-Meta-Original-Name": metadata.NamaFile,
+				},
+			}:
+			}
+		}
+		rows.Close()
+
+		if empty {
+			break
+		}
+
+		offset += config.batchSize
 	}
 }
 
@@ -272,18 +258,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 					time.Sleep(time.Second * time.Duration(attempts))
 				}
 
-				// Get existing metadata
-				objInfo, err := client.StatObject(ctx, bucket, work.sourceKey, minio.StatObjectOptions{})
-				if err != nil {
-					lastErr = fmt.Errorf("error getting metadata: %v", err)
-					continue
-				}
-
-				// Update bucket metadata
-				userMeta := objInfo.UserMetadata
-				userMeta["X-Amz-Meta-Bucket"] = path.Join(bucket, work.targetKey)
-
-				// Copy object with new metadata
+				// Copy object with metadata
 				srcOpts := minio.CopySrcOptions{
 					Bucket: bucket,
 					Object: work.sourceKey,
@@ -292,11 +267,11 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				dstOpts := minio.CopyDestOptions{
 					Bucket:          bucket,
 					Object:          work.targetKey,
-					UserMetadata:    userMeta,
+					UserMetadata:    work.metadata,
 					ReplaceMetadata: true,
 				}
 
-				_, err = client.CopyObject(ctx, dstOpts, srcOpts)
+				_, err := client.CopyObject(ctx, dstOpts, srcOpts)
 				if err != nil {
 					lastErr = fmt.Errorf("error copying: %v", err)
 					continue
@@ -331,22 +306,18 @@ func parseFlags() Config {
 	useSSL := flag.Bool("use-ssl", true, "Use SSL for connection")
 	bucket := flag.String("bucket", "", "Target bucket (required)")
 	sourceFolder := flag.String("source-folder", "download", "Source folder")
-	baseYear := flag.Int("base-year", 0, "Base year to process files from (required)")
 	workers := flag.Int("workers", 10, "Number of worker goroutines")
-	batchSize := flag.Int("batch-size", 1000, "Number of objects to list per batch")
+	batchSize := flag.Int("batch-size", 1000, "Number of objects to process per batch")
 	maxRetries := flag.Int("max-retries", 3, "Maximum number of retries for operations")
+	dbFile := flag.String("db-file", "", "SQLite database file path (required)")
+	projectName := flag.String("project-name", "", "Project name to process from database (required)")
 
 	flag.Parse()
 
 	// Validate required flags
-	if *endpoint == "" || *accessKey == "" || *secretKey == "" || *bucket == "" || *baseYear == 0 {
+	if *endpoint == "" || *accessKey == "" || *secretKey == "" || *bucket == "" || *dbFile == "" || *projectName == "" {
 		flag.Usage()
 		os.Exit(1)
-	}
-
-	// Validate year
-	if *baseYear < 2000 || *baseYear > 2100 {
-		log.Fatal("Base year must be between 2000 and 2100")
 	}
 
 	// Validate batch size
@@ -361,12 +332,13 @@ func parseFlags() Config {
 		endpoint:        *endpoint,
 		accessKeyID:     *accessKey,
 		secretAccessKey: *secretKey,
-		useSSL:          *useSSL,
-		bucket:          *bucket,
-		sourceFolder:    cleanSourceFolder,
-		baseYear:        *baseYear,
-		workers:         *workers,
-		batchSize:       *batchSize,
-		maxRetries:      *maxRetries,
+		useSSL:         *useSSL,
+		bucket:         *bucket,
+		sourceFolder:   cleanSourceFolder,
+		workers:        *workers,
+		batchSize:      *batchSize,
+		maxRetries:     *maxRetries,
+		dbFile:         *dbFile,
+		projectName:    *projectName,
 	}
 }
