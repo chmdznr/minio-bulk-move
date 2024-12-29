@@ -33,6 +33,7 @@ type Config struct {
 	dbFile          string
 	projectName     string
 	debug           bool
+	alias           string
 }
 
 type FileOp struct {
@@ -162,12 +163,13 @@ func main() {
 	cleanupCmd.StringVar(&cleanupConfig.endpoint, "endpoint", "", "MinIO server endpoint")
 	cleanupCmd.StringVar(&cleanupConfig.accessKeyID, "access-key", "", "MinIO access key")
 	cleanupCmd.StringVar(&cleanupConfig.secretAccessKey, "secret-key", "", "MinIO secret key")
-	cleanupCmd.BoolVar(&cleanupConfig.useSSL, "use-ssl", false, "Use SSL for MinIO connection")
 	cleanupCmd.StringVar(&cleanupConfig.bucket, "bucket", "", "Source bucket name")
 	cleanupCmd.StringVar(&cleanupConfig.sourceFolder, "source-folder", "", "Source folder path in bucket")
 	cleanupCmd.IntVar(&cleanupConfig.batchSize, "batch-size", 1000, "Number of files to process per batch")
 	cleanupCmd.StringVar(&cleanupConfig.dbFile, "db-file", "", "Path to SQLite database file")
 	cleanupCmd.StringVar(&cleanupConfig.projectName, "project-name", "", "Project name to process from database")
+	cleanupCmd.StringVar(&cleanupConfig.alias, "alias", "", "MinIO alias for mc command")
+	cleanupCmd.BoolVar(&cleanupConfig.useSSL, "use-ssl", false, "Use SSL for MinIO connection")
 	cleanupCmd.BoolVar(&cleanupConfig.debug, "debug", false, "Enable debug logging")
 
 	if len(os.Args) < 2 {
@@ -266,7 +268,8 @@ func runMove(config Config) {
 func runCleanup(config Config) {
 	// Validate cleanup command flags
 	if config.endpoint == "" || config.accessKeyID == "" || config.secretAccessKey == "" ||
-		config.bucket == "" || config.dbFile == "" || config.sourceFolder == "" || config.projectName == "" {
+		config.bucket == "" || config.dbFile == "" || config.sourceFolder == "" || config.projectName == "" ||
+		config.alias == "" {
 		log.Fatal("All required flags must be provided")
 	}
 
@@ -627,11 +630,12 @@ handle_error() {
 		sourceKey := path.Join(config.sourceFolder, idFile)
 
 		// Generate mc command with error handling and progress tracking
-		cmd := fmt.Sprintf(`mc rm --versions --force "%s/%s" || handle_error "%s"
+		cmd := fmt.Sprintf(`mc rm --versions --force "%s/%s/%s" || handle_error "%s"
 ((processed_files++))
 show_progress
 `, 
-			bucket, // This should be the mc alias for the MinIO server
+			config.alias,
+			config.bucket,
 			sourceKey,
 			sourceKey)
 		
