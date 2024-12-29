@@ -385,11 +385,14 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				return
 			}
 
+			debugLog(config, "Processing file: %s -> %s", work.sourceKey, work.targetKey)
+
 			_, err := client.StatObject(ctx, bucket, work.sourceKey, minio.StatObjectOptions{})
 			if err != nil {
 				if strings.Contains(err.Error(), "The specified key does not exist") {
 					logError(stats.errorLogFile, work.sourceKey, "File does not exist in MinIO")
 					stats.errCount.Add(1)
+					stats.processedObjects.Add(1)
 					continue
 				}
 			}
@@ -397,9 +400,9 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 			var lastErr error
 			success := false
 
-			for attempts := 0; attempts < 3; attempts++ {
+			for attempts := 0; attempts < config.maxRetries; attempts++ {
 				if attempts > 0 {
-					log.Printf("Retry %d for file %s", attempts, work.sourceKey)
+					debugLog(config, "Retry %d for file %s", attempts, work.sourceKey)
 					time.Sleep(time.Second * time.Duration(attempts))
 				}
 
@@ -415,6 +418,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 					ReplaceMetadata: true,
 				}
 
+				debugLog(config, "Copying %s to %s", work.sourceKey, work.targetKey)
 				_, err := client.CopyObject(ctx, dstOpts, srcOpts)
 				if err != nil {
 					lastErr = fmt.Errorf("error copying: %v", err)
@@ -425,6 +429,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 					GovernanceBypass: true,
 				}
 
+				debugLog(config, "Listing versions for %s", work.sourceKey)
 				objectCh := client.ListObjects(ctx, bucket, minio.ListObjectsOptions{
 					Prefix:       work.sourceKey,
 					WithVersions: true,
@@ -439,6 +444,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 
 					if obj.Key == work.sourceKey {
 						opts.VersionID = obj.VersionID
+						debugLog(config, "Removing version %s of %s", obj.VersionID, work.sourceKey)
 						err = client.RemoveObject(ctx, bucket, work.sourceKey, opts)
 						if err != nil {
 							lastErr = fmt.Errorf("error removing version %s: %v", obj.VersionID, err)
@@ -459,12 +465,6 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				log.Printf("Failed to process %s after retries: %v", work.sourceKey, lastErr)
 				logError(stats.errorLogFile, work.sourceKey, lastErr.Error())
 				stats.errCount.Add(1)
-				continue
-			}
-
-			err = markFileForCleanup(ctx, work.sourceKey, config.dbFile)
-			if err != nil {
-				log.Printf("Failed to mark file %s for cleanup: %v", work.sourceKey, err)
 			}
 
 			stats.processedObjects.Add(1)
