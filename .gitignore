@@ -27,6 +27,15 @@ go.work
 .env
 *.env
 
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Binary files
+minio-bulk-move
+minio-bulk-move.exe
+
 # OS generated files
 .DS_Store
 .DS_Store?
