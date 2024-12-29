@@ -205,6 +205,7 @@ func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan
 
 			yearMonth := idFile[2:8] // Extract YYYYMM
 			targetKey := path.Join("download", yearMonth, path.Base(idFile))
+			sourceKey := path.Join(config.sourceFolder, idFile)
 
 			stats.totalObjects.Add(1)
 			stats.currentBatch = fmt.Sprintf("Batch %d-%d", offset, offset+batchCount)
@@ -214,7 +215,7 @@ func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan
 				rows.Close()
 				return
 			case workChan <- FileOp{
-				sourceKey: idFile,
+				sourceKey: sourceKey,
 				targetKey: targetKey,
 				yearMonth: yearMonth,
 				metadata: map[string]string{
