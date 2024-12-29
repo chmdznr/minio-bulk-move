@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"regexp"
@@ -28,6 +29,7 @@ type Config struct {
 	baseYear        int
 	workers         int
 	batchSize       int
+	maxRetries      int
 }
 
 type FileOp struct {
@@ -42,15 +44,24 @@ type Stats struct {
 	processedObjects atomic.Int64
 	skippedCount     atomic.Int64
 	errCount         atomic.Int64
+	currentPrefix    string
 }
 
 func main() {
 	config := parseFlags()
 
-	// Initialize MinIO client
+	// Initialize MinIO client with custom transport
+	customTransport := &http.Transport{
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+	}
+
 	minioClient, err := minio.New(config.endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(config.accessKeyID, config.secretAccessKey, ""),
-		Secure: config.useSSL,
+		Creds:     credentials.NewStaticV4(config.accessKeyID, config.secretAccessKey, ""),
+		Secure:    config.useSSL,
+		Transport: customTransport,
 	})
 	if err != nil {
 		log.Fatalf("Error initializing MinIO client: %v", err)
@@ -91,11 +102,12 @@ func main() {
 	// Start object processing
 	go func() {
 		defer close(workChan)
-		processObjectsInBatches(ctx, minioClient, config, workChan, stats)
+		processObjectsByPrefix(ctx, minioClient, config, workChan, stats)
 	}()
 
 	// Update progress
 	go func() {
+		lastPrefix := ""
 		for {
 			select {
 			case <-ctx.Done():
@@ -103,6 +115,13 @@ func main() {
 			default:
 				processed := stats.processedObjects.Load()
 				total := stats.totalObjects.Load()
+				currentPrefix := stats.currentPrefix
+
+				if currentPrefix != "" && currentPrefix != lastPrefix {
+					fmt.Printf("\nProcessing prefix: %s\n", currentPrefix)
+					lastPrefix = currentPrefix
+				}
+
 				if total > 0 {
 					bar.ChangeMax64(total)
 				}
@@ -123,71 +142,110 @@ func main() {
 	fmt.Printf("Skipped: %d (different year or invalid format)\n", stats.skippedCount.Load())
 }
 
-func processObjectsInBatches(ctx context.Context, minioClient *minio.Client, config Config,
+func generatePrefixes(baseYear int) []string {
+	var prefixes []string
+	for month := 1; month <= 12; month++ {
+		prefix := fmt.Sprintf("U-%d%02d", baseYear, month)
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes
+}
+
+func processObjectsByPrefix(ctx context.Context, minioClient *minio.Client, config Config,
 	workChan chan<- FileOp, stats *Stats) {
-	var continuationToken string
+
+	prefixes := generatePrefixes(config.baseYear)
 	re := regexp.MustCompile(`U-(\d{4})(\d{2})\d+`)
 
-	for {
-		// List objects in batches
-		opts := minio.ListObjectsOptions{
-			Prefix:     config.sourceFolder,
-			Recursive:  true,
-			MaxKeys:    config.batchSize,
-			StartAfter: continuationToken,
+	for _, prefix := range prefixes {
+		stats.currentPrefix = prefix
+		log.Printf("Starting prefix: %s", prefix)
+
+		var continuationToken string
+		for {
+			// Process batch with retries
+			var empty bool
+			var lastErr error
+
+			for attempts := 0; attempts < config.maxRetries; attempts++ {
+				if attempts > 0 {
+					log.Printf("Retry %d for prefix %s after error: %v", attempts, prefix, lastErr)
+					time.Sleep(time.Second * time.Duration(attempts*2))
+				}
+
+				empty = true
+				opts := minio.ListObjectsOptions{
+					Prefix:     path.Join(config.sourceFolder, prefix),
+					Recursive:  true,
+					MaxKeys:    config.batchSize,
+					StartAfter: continuationToken,
+				}
+
+				objects := minioClient.ListObjects(ctx, config.bucket, opts)
+
+				for object := range objects {
+					if object.Err != nil {
+						lastErr = object.Err
+						log.Printf("Error listing objects: %v", object.Err)
+						empty = false
+						break
+					}
+
+					empty = false
+					continuationToken = object.Key
+
+					matches := re.FindStringSubmatch(object.Key)
+					if len(matches) < 3 {
+						stats.skippedCount.Add(1)
+						continue
+					}
+
+					year := matches[1]
+					month := matches[2]
+
+					// Skip if year doesn't match base year
+					if year != fmt.Sprintf("%d", config.baseYear) {
+						stats.skippedCount.Add(1)
+						continue
+					}
+
+					yearMonth := year + month
+					targetKey := path.Join("download", yearMonth, path.Base(object.Key))
+
+					stats.totalObjects.Add(1)
+
+					select {
+					case <-ctx.Done():
+						return
+					case workChan <- FileOp{
+						object:    object,
+						sourceKey: object.Key,
+						targetKey: targetKey,
+						yearMonth: yearMonth,
+					}:
+					}
+				}
+
+				if lastErr == nil {
+					break // Success, exit retry loop
+				}
+			}
+
+			if lastErr != nil {
+				log.Printf("Failed to process prefix %s after %d attempts, skipping...", prefix, config.maxRetries)
+				stats.errCount.Add(1)
+				break
+			}
+
+			// If no objects were returned, we've reached the end of this prefix
+			if empty {
+				break
+			}
+
+			log.Printf("Processed batch for prefix %s up to: %s", prefix, continuationToken)
 		}
 
-		objects := minioClient.ListObjects(ctx, config.bucket, opts)
-
-		empty := true
-		for object := range objects {
-			empty = false
-			if object.Err != nil {
-				log.Printf("Error listing objects: %v", object.Err)
-				continue
-			}
-
-			continuationToken = object.Key
-
-			matches := re.FindStringSubmatch(object.Key)
-			if len(matches) < 3 {
-				stats.skippedCount.Add(1)
-				continue
-			}
-
-			year := matches[1]
-			month := matches[2]
-
-			// Skip if year doesn't match base year
-			if year != fmt.Sprintf("%d", config.baseYear) {
-				stats.skippedCount.Add(1)
-				continue
-			}
-
-			yearMonth := year + month
-			targetKey := path.Join("download", yearMonth, path.Base(object.Key))
-
-			stats.totalObjects.Add(1)
-
-			select {
-			case <-ctx.Done():
-				return
-			case workChan <- FileOp{
-				object:    object,
-				sourceKey: object.Key,
-				targetKey: targetKey,
-				yearMonth: yearMonth,
-			}:
-			}
-		}
-
-		// If no objects were returned, we've reached the end
-		if empty {
-			break
-		}
-
-		// Log progress for each batch
-		log.Printf("Processed batch up to: %s", continuationToken)
+		log.Printf("Completed prefix: %s", prefix)
 	}
 }
 
@@ -204,43 +262,59 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				return
 			}
 
-			// Copy object to new location with updated metadata
-			srcOpts := minio.CopySrcOptions{
-				Bucket: bucket,
-				Object: work.sourceKey,
+			var lastErr error
+			success := false
+
+			// Retry loop for operations
+			for attempts := 0; attempts < 3; attempts++ {
+				if attempts > 0 {
+					log.Printf("Retry %d for file %s", attempts, work.sourceKey)
+					time.Sleep(time.Second * time.Duration(attempts))
+				}
+
+				// Get existing metadata
+				objInfo, err := client.StatObject(ctx, bucket, work.sourceKey, minio.StatObjectOptions{})
+				if err != nil {
+					lastErr = fmt.Errorf("error getting metadata: %v", err)
+					continue
+				}
+
+				// Update bucket metadata
+				userMeta := objInfo.UserMetadata
+				userMeta["X-Amz-Meta-Bucket"] = path.Join(bucket, work.targetKey)
+
+				// Copy object with new metadata
+				srcOpts := minio.CopySrcOptions{
+					Bucket: bucket,
+					Object: work.sourceKey,
+				}
+
+				dstOpts := minio.CopyDestOptions{
+					Bucket:          bucket,
+					Object:          work.targetKey,
+					UserMetadata:    userMeta,
+					ReplaceMetadata: true,
+				}
+
+				_, err = client.CopyObject(ctx, dstOpts, srcOpts)
+				if err != nil {
+					lastErr = fmt.Errorf("error copying: %v", err)
+					continue
+				}
+
+				// Remove old object
+				err = client.RemoveObject(ctx, bucket, work.sourceKey, minio.RemoveObjectOptions{})
+				if err != nil {
+					lastErr = fmt.Errorf("error removing: %v", err)
+					continue
+				}
+
+				success = true
+				break
 			}
 
-			// Get existing metadata
-			objInfo, err := client.StatObject(ctx, bucket, work.sourceKey, minio.StatObjectOptions{})
-			if err != nil {
-				log.Printf("Error getting object metadata for %s: %v", work.sourceKey, err)
-				stats.errCount.Add(1)
-				continue
-			}
-
-			// Update bucket metadata
-			userMeta := objInfo.UserMetadata
-			userMeta["X-Amz-Meta-Bucket"] = path.Join(bucket, work.targetKey)
-
-			dstOpts := minio.CopyDestOptions{
-				Bucket:          bucket,
-				Object:          work.targetKey,
-				UserMetadata:    userMeta,
-				ReplaceMetadata: true,
-			}
-
-			// Copy object with new metadata
-			_, err = client.CopyObject(ctx, dstOpts, srcOpts)
-			if err != nil {
-				log.Printf("Error copying object %s to %s: %v", work.sourceKey, work.targetKey, err)
-				stats.errCount.Add(1)
-				continue
-			}
-
-			// Remove old object
-			err = client.RemoveObject(ctx, bucket, work.sourceKey, minio.RemoveObjectOptions{})
-			if err != nil {
-				log.Printf("Error removing old object %s: %v", work.sourceKey, err)
+			if !success {
+				log.Printf("Failed to process %s after retries: %v", work.sourceKey, lastErr)
 				stats.errCount.Add(1)
 				continue
 			}
@@ -260,6 +334,7 @@ func parseFlags() Config {
 	baseYear := flag.Int("base-year", 0, "Base year to process files from (required)")
 	workers := flag.Int("workers", 10, "Number of worker goroutines")
 	batchSize := flag.Int("batch-size", 1000, "Number of objects to list per batch")
+	maxRetries := flag.Int("max-retries", 3, "Maximum number of retries for operations")
 
 	flag.Parse()
 
@@ -292,5 +367,6 @@ func parseFlags() Config {
 		baseYear:        *baseYear,
 		workers:         *workers,
 		batchSize:       *batchSize,
+		maxRetries:      *maxRetries,
 	}
 }
