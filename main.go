@@ -50,6 +50,7 @@ type Stats struct {
 	currentBatch     string
 	startTime        time.Time
 	totalInDB        int64
+	errorLogFile     *os.File
 }
 
 type FileMetadata struct {
@@ -83,6 +84,54 @@ func displayProgress(stats *Stats, bar *progressbar.ProgressBar) {
 
 	bar.Describe(description)
 	bar.Set64(processed)
+}
+
+func createErrorLogFile(projectName string) (*os.File, error) {
+	// Create logs directory if it doesn't exist
+	if err := os.MkdirAll("logs", 0755); err != nil {
+		return nil, fmt.Errorf("failed to create logs directory: %v", err)
+	}
+
+	// Create or append to error log file
+	timestamp := time.Now().Format("2006-01-02")
+	filename := fmt.Sprintf("logs/%s_%s_errors.log", projectName, timestamp)
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create error log file: %v", err)
+	}
+
+	// Write header if file is new
+	fileInfo, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	if fileInfo.Size() == 0 {
+		headerText := fmt.Sprintf("Error log for project %s - Created at %s\n\n", 
+			projectName, time.Now().Format("2006-01-02 15:04:05"))
+		if _, err := f.WriteString(headerText); err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+
+	return f, nil
+}
+
+func logError(f *os.File, sourceKey, errMsg string) {
+	if f == nil {
+		return
+	}
+	
+	logEntry := fmt.Sprintf("[%s] File: %s - Error: %s\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+		sourceKey,
+		errMsg)
+	
+	if _, err := f.WriteString(logEntry); err != nil {
+		log.Printf("Failed to write to error log: %v", err)
+	}
 }
 
 func main() {
@@ -120,12 +169,21 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Create error log file
+	errorLogFile, err := createErrorLogFile(config.projectName)
+	if err != nil {
+		log.Printf("Warning: Failed to create error log file: %v", err)
+	} else {
+		defer errorLogFile.Close()
+	}
+
 	// Channel for work items
 	workChan := make(chan FileOp, config.batchSize)
 
 	// Initialize stats
 	stats := &Stats{
-		startTime: time.Now(),
+		startTime:    time.Now(),
+		errorLogFile: errorLogFile,
 	}
 
 	// Get total count from database
@@ -295,10 +353,21 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				return
 			}
 
+			// Check if source object exists first
+			_, err := client.StatObject(ctx, bucket, work.sourceKey, minio.StatObjectOptions{})
+			if err != nil {
+				if strings.Contains(err.Error(), "The specified key does not exist") {
+					// Log to error file and skip retries for missing files
+					logError(stats.errorLogFile, work.sourceKey, "File does not exist in MinIO")
+					stats.errCount.Add(1)
+					continue
+				}
+			}
+
 			var lastErr error
 			success := false
 
-			// Retry loop for operations
+			// Only retry if it's not a "key does not exist" error
 			for attempts := 0; attempts < 3; attempts++ {
 				if attempts > 0 {
 					log.Printf("Retry %d for file %s", attempts, work.sourceKey)
@@ -337,6 +406,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 
 			if !success {
 				log.Printf("Failed to process %s after retries: %v", work.sourceKey, lastErr)
+				logError(stats.errorLogFile, work.sourceKey, lastErr.Error())
 				stats.errCount.Add(1)
 				continue
 			}
