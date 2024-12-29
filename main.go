@@ -167,6 +167,7 @@ func main() {
 	cleanupCmd.StringVar(&cleanupConfig.sourceFolder, "source-folder", "", "Source folder path in bucket")
 	cleanupCmd.IntVar(&cleanupConfig.batchSize, "batch-size", 1000, "Number of files to process per batch")
 	cleanupCmd.StringVar(&cleanupConfig.dbFile, "db-file", "", "Path to SQLite database file")
+	cleanupCmd.StringVar(&cleanupConfig.projectName, "project-name", "", "Project name to process from database")
 	cleanupCmd.BoolVar(&cleanupConfig.debug, "debug", false, "Enable debug logging")
 
 	if len(os.Args) < 2 {
@@ -265,7 +266,7 @@ func runMove(config Config) {
 func runCleanup(config Config) {
 	// Validate cleanup command flags
 	if config.endpoint == "" || config.accessKeyID == "" || config.secretAccessKey == "" ||
-		config.bucket == "" || config.dbFile == "" || config.sourceFolder == "" {
+		config.bucket == "" || config.dbFile == "" || config.sourceFolder == "" || config.projectName == "" {
 		log.Fatal("All required flags must be provided")
 	}
 
