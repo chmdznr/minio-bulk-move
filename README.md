@@ -89,6 +89,7 @@ CREATE INDEX idx_files_status ON files(status);
 - `-max-retries`: Maximum number of retries for operations (default: 3)
 - `-db-file`: Path to SQLite database file (required)
 - `-project-name`: Project name to process from database (required)
+- `-debug`: Enable verbose debug logging (default: false)
 
 ### Example
 
@@ -128,6 +129,38 @@ The command will:
 3. Move files from their current location to year-month based folders
 4. Preserve and enhance metadata (original path, module name, etc.)
 5. Show progress with current batch information
+
+## Error Logging
+
+The tool creates project-specific error logs in the `logs` directory:
+- Log files are named: `PROJECT_NAME_YYYY-MM-DD_errors.log`
+- Each error entry includes timestamp, file path, and error message
+- Non-existent files are logged but not retried
+- Other errors are retried according to `-max-retries`
+
+Example error log:
+```
+Error log for project your-project-name - Created at 2024-12-29 10:34:05
+
+[2024-12-29 10:34:06] File: download/U-202112021437291615307 - Error: File does not exist in MinIO
+[2024-12-29 10:34:07] File: download/U-202106192023269775621 - Error: error copying: connection reset
+```
+
+## Debug Mode
+
+For troubleshooting, use the `-debug` flag to enable verbose logging:
+```bash
+./minio-bulk-move \
+  ... other flags ... \
+  -debug
+```
+
+Debug mode shows:
+- Database queries and parameters
+- Individual record processing
+- Batch completion status
+- Table schema information
+- Project and status counts
 
 ## Database Usage
 
