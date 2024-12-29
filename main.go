@@ -33,6 +33,7 @@ type Config struct {
 	maxRetries      int
 	dbFile          string
 	projectName     string
+	debug           bool
 }
 
 type FileOp struct {
@@ -134,6 +135,12 @@ func logError(f *os.File, sourceKey, errMsg string) {
 	}
 }
 
+func debugLog(config Config, format string, args ...interface{}) {
+	if config.debug {
+		log.Printf(format, args...)
+	}
+}
+
 func main() {
 	config := parseFlags()
 
@@ -163,7 +170,7 @@ func main() {
 
 	// Check database schema and counts
 	log.Printf("Checking database %s...", config.dbFile)
-	checkDatabase(db)
+	checkDatabase(db, config)
 
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
@@ -262,8 +269,7 @@ func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan
 			ORDER BY id
 			LIMIT ? OFFSET ?`
 
-		// Debug: Print query and parameters
-		log.Printf("Running query with project_name=%s, limit=%d, offset=%d", config.projectName, config.batchSize, offset)
+		debugLog(config, "Running query with project_name=%s, limit=%d, offset=%d", config.projectName, config.batchSize, offset)
 
 		rows, err := db.QueryContext(ctx, query, config.projectName, config.batchSize, offset)
 		if err != nil {
@@ -284,8 +290,7 @@ func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan
 				continue
 			}
 
-			// Debug: Print row data
-			log.Printf("Found record: id_file=%s, filepath=%s, metadata=%s", idFile, filepath, metadataStr)
+			debugLog(config, "Found record: id_file=%s, filepath=%s, metadata=%s", idFile, filepath, metadataStr)
 
 			// Parse metadata
 			var metadata FileMetadata
@@ -327,12 +332,10 @@ func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan
 		}
 		rows.Close()
 
-		// Debug: Print batch results
-		log.Printf("Batch completed: found %d records", batchCount)
+		debugLog(config, "Batch completed: found %d records", batchCount)
 
 		if empty {
-			// Debug: Print when no more records
-			log.Printf("No more records found, exiting")
+			debugLog(config, "No more records found, exiting")
 			break
 		}
 
@@ -416,7 +419,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 	}
 }
 
-func checkDatabase(db *sql.DB) {
+func checkDatabase(db *sql.DB, config Config) {
 	// Check table schema
 	rows, err := db.Query("SELECT sql FROM sqlite_master WHERE type='table' AND name='files'")
 	if err != nil {
@@ -430,7 +433,7 @@ func checkDatabase(db *sql.DB) {
 		if err := rows.Scan(&tableSQL); err != nil {
 			log.Printf("Error reading table schema: %v", err)
 		} else {
-			log.Printf("Table schema: %s", tableSQL)
+			debugLog(config, "Table schema: %s", tableSQL)
 		}
 	}
 
@@ -449,7 +452,7 @@ func checkDatabase(db *sql.DB) {
 			log.Printf("Error reading count: %v", err)
 			continue
 		}
-		log.Printf("Project: %s, Status: %s, Count: %d", projectName, status, count)
+		debugLog(config, "Project: %s, Status: %s, Count: %d", projectName, status, count)
 	}
 }
 
@@ -465,6 +468,7 @@ func parseFlags() Config {
 	maxRetries := flag.Int("max-retries", 3, "Maximum number of retries for operations")
 	dbFile := flag.String("db-file", "", "SQLite database file path (required)")
 	projectName := flag.String("project-name", "", "Project name to process from database (required)")
+	debug := flag.Bool("debug", false, "Enable debug logging")
 
 	flag.Parse()
 
@@ -494,5 +498,6 @@ func parseFlags() Config {
 		maxRetries:     *maxRetries,
 		dbFile:         *dbFile,
 		projectName:    *projectName,
+		debug:          *debug,
 	}
 }
