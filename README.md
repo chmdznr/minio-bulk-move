@@ -5,6 +5,7 @@ A Go application for efficiently moving files in MinIO storage based on their ye
 ## Features
 
 - Database-driven file processing for improved performance
+- Split command structure for move and cleanup operations
 - Batch processing with configurable batch size
 - Concurrent processing with multiple workers
 - Progress bar showing real-time processing status
@@ -14,6 +15,8 @@ A Go application for efficiently moving files in MinIO storage based on their ye
 - Real-time progress tracking with batch information
 - Metadata preservation and enhancement
 - Optimized HTTP transport settings
+- Versioned object support with separate cleanup process
+- Generates cleanup script with real-time progress tracking
 
 ## Prerequisites
 
@@ -21,6 +24,7 @@ A Go application for efficiently moving files in MinIO storage based on their ye
 - Access to a MinIO server
 - MinIO credentials (access key and secret key)
 - SQLite database with file information
+- MinIO Client (mc) configured for cleanup operations
 
 ## Installation
 
@@ -34,6 +38,9 @@ go mod download
 
 # Build static binary
 go build -o minio-bulk-move
+
+# Configure MinIO Client (mc) for cleanup operations
+mc alias set minio http://your-minio-server ACCESSKEY SECRETKEY
 ```
 
 ## Database Schema
@@ -68,22 +75,66 @@ CREATE INDEX idx_files_status ON files(status);
 
 ## Usage
 
-```bash
-# For Windows
-.\minio-bulk-move.exe [flags]
+The application supports two main commands: `move` and `cleanup`.
 
-# For Unix-like systems
-./minio-bulk-move [flags]
+### Move Command
+
+Moves files to their new locations based on year-month pattern:
+
+```powershell
+.\minio-bulk-move.exe move `
+    -endpoint localhost:9000 `
+    -access-key YOUR_ACCESS_KEY `
+    -secret-key YOUR_SECRET_KEY `
+    -use-ssl false `
+    -bucket your-bucket `
+    -source-folder "download" `
+    -workers 10 `
+    -batch-size 1000 `
+    -max-retries 3 `
+    -db-file path/to/db.sqlite `
+    -project-name your-project `
+    -debug false
+```
+
+### Cleanup Command
+
+Instead of directly removing versioned objects (which can be very slow with millions of files), the cleanup command generates a shell script with progress tracking:
+
+```powershell
+.\minio-bulk-move.exe cleanup `
+    -endpoint localhost:9000 `
+    -access-key YOUR_ACCESS_KEY `
+    -secret-key YOUR_SECRET_KEY `
+    -use-ssl false `
+    -bucket your-bucket `
+    -source-folder "download" `
+    -db-file path/to/db.sqlite `
+    -batch-size 1000 `
+    -debug false
+```
+
+This will generate a script (`cleanup_YYYYMMDD_HHMMSS.sh`) that:
+- Shows real-time progress in terminal
+- Saves progress to `cleanup_progress.log`
+- Logs errors to `cleanup_errors.log`
+- Can be interrupted and resumed
+- Tracks processing rate and ETA
+
+Example cleanup script output:
+```
+Progress: 45.2% | Processed: 452/1000 | Failed: 2 | Rate: 0.25 files/sec | ETA: 06:30:45
 ```
 
 ### Available Flags
 
+#### Move Command Flags
 - `-endpoint`: MinIO server endpoint (required)
 - `-access-key`: MinIO access key (required)
 - `-secret-key`: MinIO secret key (required)
 - `-use-ssl`: Use SSL for MinIO connection
 - `-bucket`: Source bucket name (required)
-- `-source-folder`: Source folder path in the bucket
+- `-source-folder`: Source folder path in bucket (required)
 - `-workers`: Number of concurrent workers (default: 10)
 - `-batch-size`: Number of files to process per batch (default: 1000)
 - `-max-retries`: Maximum number of retries for operations (default: 3)
@@ -91,133 +142,47 @@ CREATE INDEX idx_files_status ON files(status);
 - `-project-name`: Project name to process from database (required)
 - `-debug`: Enable verbose debug logging (default: false)
 
-### Example
+#### Cleanup Command Flags
+- `-endpoint`: MinIO server endpoint (required)
+- `-access-key`: MinIO access key (required)
+- `-secret-key`: MinIO secret key (required)
+- `-use-ssl`: Use SSL for MinIO connection
+- `-bucket`: Source bucket name (required)
+- `-source-folder`: Source folder path in bucket (required)
+- `-db-file`: Path to SQLite database file (required)
+- `-batch-size`: Number of files to process per batch (default: 1000)
+- `-debug`: Enable verbose debug logging (default: false)
 
-```powershell
-# For Windows PowerShell
-.\minio-bulk-move.exe `
-  -endpoint localhost:9000 `
-  -access-key YOUR_ACCESS_KEY `
-  -secret-key YOUR_SECRET_KEY `
-  -bucket your-bucket-name `
-  -source-folder download `
-  -workers 10 `
-  -batch-size 1000 `
-  -max-retries 3 `
-  -use-ssl=false `
-  -db-file your-database.db `
-  -project-name your-project-name
+## File Processing Flow
 
-# For Unix-like systems (bash)
-./minio-bulk-move \
-  -endpoint localhost:9000 \
-  -access-key YOUR_ACCESS_KEY \
-  -secret-key YOUR_SECRET_KEY \
-  -bucket your-bucket-name \
-  -source-folder download \
-  -workers 10 \
-  -batch-size 1000 \
-  -max-retries 3 \
-  -use-ssl=false \
-  -db-file ./your-database.db \
-  -project-name your-project-name
-```
+1. **Move Operation**:
+   - Reads files from SQLite database
+   - Constructs new path based on year-month pattern
+   - Copies file with preserved metadata to new location
+   - Removes the latest version of the source file
+   - Marks file as 'pending_cleanup' in database
 
-The command will:
-1. Connect to local MinIO server on port 9000
-2. Process files from the specified project in the database
-3. Move files from their current location to year-month based folders
-4. Preserve and enhance metadata (original path, module name, etc.)
-5. Show progress with current batch information
+2. **Cleanup Operation**:
+   - Generates a shell script to handle version cleanup
+   - Script uses MinIO Client (mc) for efficient version removal
+   - Includes progress tracking and error logging
+   - Can be run independently during off-peak hours
 
-## Error Logging
+## Error Handling
 
-The tool creates project-specific error logs in the `logs` directory:
-- Log files are named: `PROJECT_NAME_YYYY-MM-DD_errors.log`
-- Each error entry includes timestamp, file path, and error message
-- Non-existent files are logged but not retried
-- Other errors are retried according to `-max-retries`
+- Failed moves are logged with detailed error messages
+- Failed cleanups are logged to `cleanup_errors.log`
+- All operations support configurable retries
+- Detailed error logs are saved to `logs/[project_name]_[date]_errors.log`
 
-Example error log:
-```
-Error log for project your-project-name - Created at 2024-12-29 10:34:05
+## Performance Considerations
 
-[2024-12-29 10:34:06] File: download/U-202112021437291615307 - Error: File does not exist in MinIO
-[2024-12-29 10:34:07] File: download/U-202106192023269775621 - Error: error copying: connection reset
-```
-
-## Debug Mode
-
-For troubleshooting, use the `-debug` flag to enable verbose logging:
-```bash
-./minio-bulk-move \
-  ... other flags ... \
-  -debug
-```
-
-Debug mode shows:
-- Database queries and parameters
-- Individual record processing
-- Batch completion status
-- Table schema information
-- Project and status counts
-
-## Database Usage
-
-The tool uses the SQLite database to:
-1. Get list of files to process (avoiding slow MinIO ListObjects)
-2. Track file metadata and original paths
-3. Process files in efficient batches
-
-The tool expects files in the database to have:
-- `id_file`: The object name in MinIO
-- `filepath`: Original file path
-- `f_metadata`: JSON metadata with fields:
-  ```json
-  {
-    "existing_id": "P-XXXXXXXXXX",
-    "id_profile": "XXXXXXXXX",
-    "nama_file_asli": "Original filename.pdf",
-    "nama_modul": "Module name"
-  }
-  ```
-- `status`: Should be 'uploaded' for files to process
-
-### Example Database Record
-```sql
-SELECT id_file, filepath, f_metadata FROM files LIMIT 1;
-
--- Result:
--- id_file: "U-202112150934130542920"
--- filepath: "documents/P-202103311006210636094/folder1/DOCUMENT.pdf"
--- f_metadata: {
---   "existing_id": "P-202103311006210636094",
---   "id_profile": "1220183059",
---   "nama_file_asli": "DOCUMENT.pdf",
---   "nama_modul": "documents"
--- }
-```
-
-## Performance Tips
-
-When dealing with massive file sets:
-
-1. **Batch Size**: Adjust `-batch-size` based on your system's memory capacity. Lower values (500-1000) are safer but slower, higher values may be faster but use more memory.
-
-2. **Workers**: The `-workers` flag controls concurrent operations. Start with 10 and adjust based on:
-   - Available system resources
-   - Network capacity
-   - MinIO server capacity
-
-3. **Retries**: Use `-max-retries` to handle temporary failures. Default is 3, increase in unstable networks.
-
-4. **Database Indexes**: The application relies on database indexes for efficient querying. Make sure the recommended indexes are created.
-
-5. **Network**: Ensure stable network connection as the tool performs multiple operations:
-   - Reading from SQLite database
-   - Copying objects in MinIO
-   - Removing original objects
-   - Updating metadata
+- Use appropriate batch size based on your system resources
+- Adjust worker count based on available CPU cores
+- Run cleanup script during off-peak hours
+- Monitor MinIO server load during bulk operations
+- Consider splitting cleanup script for parallel execution
+- Version cleanup can take several minutes per file
 
 ## Dependencies
 
