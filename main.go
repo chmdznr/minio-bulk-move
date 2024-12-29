@@ -214,25 +214,7 @@ func main() {
 	}
 
 	// Create progress bar
-	bar := progressbar.NewOptions64(
-		totalCount,
-		progressbar.OptionSetDescription("Starting..."),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "=",
-			SaucerHead:    ">",
-			SaucerPadding: " ",
-			BarStart:      "[",
-			BarEnd:        "]",
-		}),
-		progressbar.OptionEnableColorCodes(true),
-		progressbar.OptionSetWidth(40),
-		progressbar.OptionShowCount(),
-		progressbar.OptionSetPredictTime(true),
-		progressbar.OptionShowIts(),
-		progressbar.OptionOnCompletion(func() {
-			fmt.Println("\nOperation completed!")
-		}),
-	)
+	bar := showProgress(stats, totalCount)
 
 	// Start progress update goroutine
 	go func() {
@@ -331,8 +313,6 @@ func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan
 			}
 		}
 		rows.Close()
-
-		debugLog(config, "Batch completed: found %d records", batchCount)
 
 		if empty {
 			debugLog(config, "No more records found, exiting")
@@ -500,4 +480,32 @@ func parseFlags() Config {
 		projectName:    *projectName,
 		debug:          *debug,
 	}
+}
+
+func showProgress(stats *Stats, totalFiles int64) *progressbar.ProgressBar {
+	return progressbar.NewOptions64(
+		totalFiles,
+		progressbar.OptionSetDescription("Processing files..."),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionShowBytes(false),
+		progressbar.OptionSetWidth(15),
+		progressbar.OptionThrottle(100*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(os.Stderr, "\n")
+		}),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionFullWidth(),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionSetElapsedTime(true),
+		progressbar.OptionSetPredictTime(true),
+		progressbar.OptionShowElapsedTimeOnFinish(),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
 }
