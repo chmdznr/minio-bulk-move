@@ -510,15 +510,15 @@ func showProgress(stats *Stats, totalFiles int64) *progressbar.ProgressBar {
 	)
 }
 
-func markFileForCleanup(ctx context.Context, filepath string, dbFile string) error {
+func markFileForCleanup(ctx context.Context, sourceKey string, dbFile string) error {
 	db, err := sql.Open("sqlite3", dbFile)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %v", err)
 	}
 	defer db.Close()
 
-	query := `UPDATE files SET status = 'pending_cleanup' WHERE filepath = ?`
-	_, err = db.ExecContext(ctx, query, filepath)
+	query := `UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?`
+	_, err = db.ExecContext(ctx, query, path.Base(sourceKey))
 	return err
 }
 
@@ -528,6 +528,18 @@ func cleanupVersions(ctx context.Context, client *minio.Client, bucket string, c
 		return fmt.Errorf("failed to open database: %v", err)
 	}
 	defer db.Close()
+
+	// Get total count first
+	var totalCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM files WHERE status = 'pending_cleanup' AND project_name = ?", config.projectName).Scan(&totalCount)
+	if err != nil {
+		return fmt.Errorf("failed to get total count: %v", err)
+	}
+
+	if totalCount == 0 {
+		log.Printf("No files to cleanup for project %s", config.projectName)
+		return nil
+	}
 
 	// Create cleanup script file
 	timestamp := time.Now().Format("20060102_150405")
@@ -548,7 +560,7 @@ func cleanupVersions(ctx context.Context, client *minio.Client, bucket string, c
 	// Add progress tracking functions
 	f.WriteString(`# Progress tracking
 start_time=$(date +%s)
-total_files=0
+total_files=` + fmt.Sprintf("%d", totalCount) + `
 processed_files=0
 failed_files=0
 progress_file="cleanup_progress.log"
@@ -567,34 +579,27 @@ show_progress() {
     # Calculate ETA
     remaining_files=$((total_files - processed_files))
     if [ $rate != "0" ]; then
-        eta_seconds=$(bc <<< "scale=0; $remaining_files / $rate")
-        eta_time=$(date -d "@$((current_time + eta_seconds))" '+%H:%M:%S')
+        eta=$((remaining_files / rate))
+        eta_formatted=$(date -u -d @$eta '+%H:%M:%S')
     else
-        eta_time="Unknown"
+        eta_formatted="Unknown"
     fi
 
-    # Progress percentage
-    progress=$(bc <<< "scale=2; ($processed_files * 100) / $total_files")
-    
     # Update progress file
-    echo "Progress: $progress%" > "$progress_file"
-    echo "Processed: $processed_files / $total_files" >> "$progress_file"
+    echo "Progress: $processed_files/$total_files ($(($processed_files * 100 / $total_files))%)" >> "$progress_file"
     echo "Failed: $failed_files" >> "$progress_file"
     echo "Rate: $rate files/sec" >> "$progress_file"
-    echo "ETA: $eta_time" >> "$progress_file"
-    echo "Elapsed: $(date -u -d @${elapsed} '+%H:%M:%S')" >> "$progress_file"
-    
+    echo "ETA: $eta_formatted" >> "$progress_file"
+    echo "Last update: $(date)" >> "$progress_file"
+
     # Show progress in terminal
-    echo -ne "\rProgress: ${progress}% | Processed: ${processed_files}/${total_files} | Failed: ${failed_files} | Rate: ${rate} files/sec | ETA: ${eta_time}"
+    echo -ne "\rProgress: $processed_files/$total_files ($(($processed_files * 100 / $total_files))%) | Rate: $rate files/sec | ETA: $eta_formatted"
 }
 
 handle_error() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: $1" >> "cleanup_errors.log"
+    echo "Error processing $1" >> cleanup_errors.log
     ((failed_files++))
-    show_progress
 }
-
-trap show_progress EXIT
 
 `)
 
@@ -602,8 +607,8 @@ trap show_progress EXIT
 	rows, err := db.QueryContext(ctx, `
 		SELECT id_file, filepath, f_metadata 
 		FROM files 
-		WHERE status = 'pending_cleanup' 
-		LIMIT ?`, config.batchSize)
+		WHERE status = 'pending_cleanup' AND project_name = ?
+		LIMIT ?`, config.projectName, config.batchSize)
 	if err != nil {
 		return fmt.Errorf("failed to query files: %v", err)
 	}
@@ -619,11 +624,6 @@ trap show_progress EXIT
 
 		// Construct the source key using the same logic as move operation
 		sourceKey := path.Join(config.sourceFolder, idFile)
-		
-		if count == 0 {
-			// Write total files counter after the functions
-			f.WriteString(fmt.Sprintf("\n# Set total files\ntotal_files=%d\n\n", config.batchSize))
-		}
 
 		// Generate mc command with error handling and progress tracking
 		cmd := fmt.Sprintf(`mc rm --versions --force %s/%s/%s || handle_error "%s"
@@ -649,16 +649,17 @@ show_progress
 echo "Total processed: $processed_files"
 echo "Total failed: $failed_files"
 echo "Time taken: $(date -u -d @$(($(date +%s) - start_time)) '+%H:%M:%S')"
+echo "See cleanup_errors.log for any errors"
 `)
 
 	fmt.Printf("\nGenerated cleanup script: %s\n", scriptFile)
-	fmt.Printf("Total objects to cleanup: %d\n", count)
-	fmt.Println("\nTo perform cleanup:")
+	fmt.Printf("Total objects to cleanup: %d\n\n", totalCount)
+	fmt.Println("To perform cleanup:")
 	fmt.Println("1. Review the generated script")
 	fmt.Println("2. Configure mc with your MinIO credentials")
 	fmt.Println("3. Run the script (it may take several hours)")
-	fmt.Println("   bash", scriptFile)
-	fmt.Println("\nThe script will:")
+	fmt.Printf("   bash %s\n\n", scriptFile)
+	fmt.Println("The script will:")
 	fmt.Println("- Show real-time progress in terminal")
 	fmt.Println("- Save progress to cleanup_progress.log")
 	fmt.Println("- Log errors to cleanup_errors.log")
