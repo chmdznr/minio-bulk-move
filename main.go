@@ -48,6 +48,8 @@ type Stats struct {
 	skippedCount     atomic.Int64
 	errCount         atomic.Int64
 	currentBatch     string
+	startTime        time.Time
+	totalInDB        int64
 }
 
 type FileMetadata struct {
@@ -55,6 +57,32 @@ type FileMetadata struct {
 	IDProfile  string `json:"id_profile"`
 	NamaFile   string `json:"nama_file_asli"`
 	NamaModul  string `json:"nama_modul"`
+}
+
+func displayProgress(stats *Stats, bar *progressbar.ProgressBar) {
+	processed := stats.processedObjects.Load()
+	errors := stats.errCount.Load()
+	skipped := stats.skippedCount.Load()
+	total := stats.totalInDB
+	elapsed := time.Since(stats.startTime).Seconds()
+	speed := float64(processed) / elapsed
+
+	remaining := total - processed - errors - skipped
+	eta := time.Duration(float64(remaining) / speed) * time.Second
+
+	percentage := float64(processed+errors+skipped) / float64(total) * 100
+
+	description := fmt.Sprintf("\rBatch: %s | Progress: %.1f%% | Processed: %d | Failed: %d | Skipped: %d | Speed: %.0f files/s | ETA: %v",
+		stats.currentBatch,
+		percentage,
+		processed,
+		errors,
+		skipped,
+		speed,
+		eta.Round(time.Second))
+
+	bar.Describe(description)
+	bar.Set64(processed)
 }
 
 func main() {
@@ -92,7 +120,17 @@ func main() {
 	workChan := make(chan FileOp, config.batchSize)
 
 	// Initialize stats
-	stats := &Stats{}
+	stats := &Stats{
+		startTime: time.Now(),
+	}
+
+	// Get total count from database
+	var totalCount int64
+	err = db.QueryRow("SELECT COUNT(*) FROM files WHERE project_name = ? AND status = 'uploaded'", config.projectName).Scan(&totalCount)
+	if err != nil {
+		log.Fatalf("Failed to get total count: %v", err)
+	}
+	stats.totalInDB = totalCount
 
 	// Create WaitGroup for workers
 	var wg sync.WaitGroup
@@ -108,44 +146,37 @@ func main() {
 
 	// Create progress bar
 	bar := progressbar.NewOptions64(
-		-1,
-		progressbar.OptionSetDescription("Processing files"),
+		totalCount,
+		progressbar.OptionSetDescription("Starting..."),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionSetWidth(40),
 		progressbar.OptionShowCount(),
-		progressbar.OptionShowIts(),
-		progressbar.OptionSetItsString("files"),
 		progressbar.OptionSetPredictTime(true),
+		progressbar.OptionShowIts(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Println("\nOperation completed!")
+		}),
 	)
+
+	// Start progress update goroutine
+	go func() {
+		for {
+			displayProgress(stats, bar)
+			time.Sleep(time.Second)
+		}
+	}()
 
 	// Start processing files from database
 	go func() {
 		defer close(workChan)
 		processFilesFromDB(ctx, db, config, workChan, stats)
-	}()
-
-	// Update progress
-	go func() {
-		lastBatch := ""
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				processed := stats.processedObjects.Load()
-				total := stats.totalObjects.Load()
-				currentBatch := stats.currentBatch
-
-				if currentBatch != "" && currentBatch != lastBatch {
-					fmt.Printf("\nProcessing batch: %s\n", currentBatch)
-					lastBatch = currentBatch
-				}
-
-				if total > 0 {
-					bar.ChangeMax64(total)
-				}
-				bar.Set64(processed)
-				time.Sleep(time.Second)
-			}
-		}
 	}()
 
 	// Wait for all workers to complete
