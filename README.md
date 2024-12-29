@@ -96,35 +96,35 @@ CREATE INDEX idx_files_status ON files(status);
 # For Windows PowerShell
 .\minio-bulk-move.exe `
   -endpoint localhost:9000 `
-  -access-key minio-oss-pdn `
-  -secret-key 1CcQ0sv1IXF0u1JMc30FJe `
-  -bucket oss-mirror-nfs `
+  -access-key YOUR_ACCESS_KEY `
+  -secret-key YOUR_SECRET_KEY `
+  -bucket your-bucket-name `
   -source-folder download `
   -workers 10 `
   -batch-size 1000 `
   -max-retries 3 `
   -use-ssl=false `
-  -db-file 2021-perizinan-recheck.db `
-  -project-name 2021-perizinan-recheck
+  -db-file your-database.db `
+  -project-name your-project-name
 
 # For Unix-like systems (bash)
 ./minio-bulk-move \
   -endpoint localhost:9000 \
-  -access-key minio-oss-pdn \
-  -secret-key 1CcQ0sv1IXF0u1JMc30FJe \
-  -bucket oss-mirror-nfs \
+  -access-key YOUR_ACCESS_KEY \
+  -secret-key YOUR_SECRET_KEY \
+  -bucket your-bucket-name \
   -source-folder download \
   -workers 10 \
   -batch-size 1000 \
   -max-retries 3 \
   -use-ssl=false \
-  -db-file ./2021-perizinan-recheck.db \
-  -project-name 2021-perizinan-recheck
+  -db-file ./your-database.db \
+  -project-name your-project-name
 ```
 
 The command will:
 1. Connect to local MinIO server on port 9000
-2. Process files from the "2021-perizinan-recheck" project in the database
+2. Process files from the specified project in the database
 3. Move files from their current location to year-month based folders
 4. Preserve and enhance metadata (original path, module name, etc.)
 5. Show progress with current batch information
@@ -156,12 +156,12 @@ SELECT id_file, filepath, f_metadata FROM files LIMIT 1;
 
 -- Result:
 -- id_file: "U-202112150934130542920"
--- filepath: "perizinan/P-202103311006210636094/undefined/IZIN OPERASIONAL.pdf"
+-- filepath: "documents/P-202103311006210636094/folder1/DOCUMENT.pdf"
 -- f_metadata: {
 --   "existing_id": "P-202103311006210636094",
 --   "id_profile": "1220183059",
---   "nama_file_asli": "IZIN OPERASIONAL.pdf",
---   "nama_modul": "perizinan"
+--   "nama_file_asli": "DOCUMENT.pdf",
+--   "nama_modul": "documents"
 -- }
 ```
 
