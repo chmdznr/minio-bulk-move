@@ -219,6 +219,24 @@ func runMove(config Config) {
 	defer errorLogFile.Close()
 	stats.errorLogFile = errorLogFile
 
+	db, err := sql.Open("sqlite3", config.dbFile)
+	if err != nil {
+		log.Fatalf("Error opening database: %v", err)
+	}
+	defer db.Close()
+
+	// Get total count first
+	var totalCount int64
+	err = db.QueryRow("SELECT COUNT(*) FROM files WHERE project_name = ? AND status = 'uploaded'", config.projectName).Scan(&totalCount)
+	if err != nil {
+		log.Fatalf("Error getting total count: %v", err)
+	}
+	if totalCount == 0 {
+		log.Printf("No files to process for project %s", config.projectName)
+		return
+	}
+	stats.totalInDB = totalCount
+
 	workChan := make(chan FileOp, config.batchSize)
 
 	var wg sync.WaitGroup
@@ -227,14 +245,8 @@ func runMove(config Config) {
 		go worker(ctx, minioClient, config.bucket, workChan, &wg, stats, config)
 	}
 
-	bar := showProgress(stats, 0)
+	bar := showProgress(stats, totalCount)
 	defer bar.Close()
-
-	db, err := sql.Open("sqlite3", config.dbFile)
-	if err != nil {
-		log.Fatalf("Error opening database: %v", err)
-	}
-	defer db.Close()
 
 	checkDatabase(db, config)
 
@@ -244,6 +256,7 @@ func runMove(config Config) {
 	wg.Wait()
 
 	fmt.Printf("\nOperation completed in %v\n", time.Since(stats.startTime))
+	fmt.Printf("Total files: %d\n", totalCount)
 	fmt.Printf("Processed: %d files\n", stats.processedObjects.Load())
 	fmt.Printf("Errors: %d\n", stats.errCount.Load())
 	fmt.Printf("Skipped: %d\n", stats.skippedCount.Load())
