@@ -425,35 +425,10 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 					continue
 				}
 
-				opts := minio.RemoveObjectOptions{
-					GovernanceBypass: true,
-				}
-
-				debugLog(config, "Listing versions for %s", work.sourceKey)
-				objectCh := client.ListObjects(ctx, bucket, minio.ListObjectsOptions{
-					Prefix:       work.sourceKey,
-					WithVersions: true,
-					Recursive:    false,  
-				})
-
-				for obj := range objectCh {
-					if obj.Err != nil {
-						lastErr = fmt.Errorf("error listing versions: %v", obj.Err)
-						continue
-					}
-
-					if obj.Key == work.sourceKey {
-						opts.VersionID = obj.VersionID
-						debugLog(config, "Removing version %s of %s", obj.VersionID, work.sourceKey)
-						err = client.RemoveObject(ctx, bucket, work.sourceKey, opts)
-						if err != nil {
-							lastErr = fmt.Errorf("error removing version %s: %v", obj.VersionID, err)
-							continue
-						}
-					}
-				}
-
-				if lastErr != nil {
+				// Mark for cleanup instead of removing versions here
+				err = markFileForCleanup(ctx, work.sourceKey, config.dbFile)
+				if err != nil {
+					lastErr = fmt.Errorf("error marking for cleanup: %v", err)
 					continue
 				}
 
