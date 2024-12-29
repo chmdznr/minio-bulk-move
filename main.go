@@ -376,10 +376,36 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 					continue
 				}
 
-				// Remove old object
-				err = client.RemoveObject(ctx, bucket, work.sourceKey, minio.RemoveObjectOptions{})
-				if err != nil {
-					lastErr = fmt.Errorf("error removing: %v", err)
+				// Remove all versions of the old object
+				opts := minio.RemoveObjectOptions{
+					GovernanceBypass: true,
+				}
+
+				// List all versions of the object
+				objectCh := client.ListObjects(ctx, bucket, minio.ListObjectsOptions{
+					Prefix:       work.sourceKey,
+					Recursive:    true,
+					WithVersions: true,
+				})
+
+				// Remove each version
+				for obj := range objectCh {
+					if obj.Err != nil {
+						lastErr = fmt.Errorf("error listing versions: %v", obj.Err)
+						continue
+					}
+
+					if obj.Key == work.sourceKey {
+						opts.VersionID = obj.VersionID
+						err = client.RemoveObject(ctx, bucket, work.sourceKey, opts)
+						if err != nil {
+							lastErr = fmt.Errorf("error removing version %s: %v", obj.VersionID, err)
+							continue
+						}
+					}
+				}
+
+				if lastErr != nil {
 					continue
 				}
 
