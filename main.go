@@ -206,8 +206,9 @@ func main() {
 	moveCmd.IntVar(&moveConfig.batchSize, "batch-size", 1000, "Number of files to process per batch")
 	moveCmd.IntVar(&moveConfig.maxRetries, "max-retries", 3, "Maximum number of retries for operations")
 	moveCmd.StringVar(&moveConfig.dbFile, "db-file", "", "Path to SQLite database file")
-	moveConfig.projectName = "project1"
-	moveConfig.debug = true
+	moveCmd.StringVar(&moveConfig.projectName, "project-name", "", "Project name to process from database")
+	moveCmd.BoolVar(&moveConfig.debug, "debug", false, "Enable debug logging")
+	moveConfig.alias = ""
 
 	cleanupConfig := Config{}
 	cleanupCmd.StringVar(&cleanupConfig.endpoint, "endpoint", "", "MinIO server endpoint")
