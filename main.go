@@ -295,7 +295,6 @@ func updateDatabase(ctx context.Context, successFiles []string, dbFile string) e
 		PRAGMA journal_mode = MEMORY;
 		PRAGMA temp_store = MEMORY;
 		PRAGMA cache_size = -2000000;
-		PRAGMA locking_mode = EXCLUSIVE;
 	`); err != nil {
 		return fmt.Errorf("error setting database optimizations: %v", err)
 	}
