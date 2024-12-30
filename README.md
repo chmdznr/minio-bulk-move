@@ -88,25 +88,27 @@ Moves files to their new locations based on year-month pattern:
     -secret-key YOUR_SECRET_KEY \
     -bucket your-bucket \
     -source-folder "download" \
+    -db-file path/to/db.sqlite \
+    -project-name your-project \
     -workers 10 \
     -batch-size 1000 \
     -max-retries 3 \
-    -db-file path/to/db.sqlite \
-    -project-name your-project \
     -use-ssl=false \
     -debug false
 
-# Parameters:
+# Required Parameters:
 #   -endpoint        : MinIO server endpoint
 #   -access-key      : MinIO access key
 #   -secret-key      : MinIO secret key
 #   -bucket          : Source bucket name
 #   -source-folder   : Source folder path in bucket
+#   -db-file         : Path to SQLite database file
+#   -project-name    : Project name to process from database
+
+# Optional Parameters:
 #   -workers         : Number of concurrent workers (default: 10)
 #   -batch-size      : Number of files to process per batch (default: 1000)
 #   -max-retries     : Maximum number of retries for operations (default: 3)
-#   -db-file         : Path to SQLite database file
-#   -project-name    : Project name to process from database
 #   -use-ssl         : Use SSL for MinIO connection (default: false)
 #   -debug           : Enable debug logging (default: false)
 ```
@@ -116,38 +118,25 @@ Moves files to their new locations based on year-month pattern:
 Generates and executes a script to clean up versioned objects:
 
 ```bash
-# Step 1: Generate cleanup script
 ./minio-bulk-move cleanup \
-    -endpoint localhost:9000 \
-    -access-key YOUR_ACCESS_KEY \
-    -secret-key YOUR_SECRET_KEY \
     -bucket your-bucket \
     -source-folder "download" \
-    -batch-size 1000 \
     -db-file path/to/db.sqlite \
     -project-name your-project \
     -alias minio \
-    -use-ssl=false \
+    -batch-size 1000 \
     -debug false
 
-# Parameters:
-#   -endpoint        : MinIO server endpoint
-#   -access-key      : MinIO access key
-#   -secret-key      : MinIO secret key
-#   -bucket          : Source bucket name
+# Required Parameters:
+#   -bucket          : MinIO bucket name
 #   -source-folder   : Source folder path in bucket
-#   -batch-size      : Number of files to process per batch (default: 1000)
 #   -db-file         : Path to SQLite database file
 #   -project-name    : Project name to process from database
 #   -alias           : MinIO alias for mc command
-#   -use-ssl         : Use SSL for MinIO connection (default: false)
+
+# Optional Parameters:
+#   -batch-size      : Number of files to process per batch (default: 1000)
 #   -debug           : Enable debug logging (default: false)
-
-# Step 2: Configure MinIO Client (mc)
-mc alias set minio http://localhost:9000 YOUR_ACCESS_KEY YOUR_SECRET_KEY
-
-# Step 3: Run the cleanup script
-bash cleanup_YYYYMMDD_HHMMSS.sh
 ```
 
 The cleanup process works in two phases:

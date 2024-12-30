@@ -15,10 +15,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/schollz/progressbar/v3"
-	_ "github.com/mattn/go-sqlite3"
 )
 
 type Config struct {
@@ -46,14 +46,14 @@ type FileOp struct {
 
 type Stats struct {
 	processedObjects atomic.Int64
-	errCount        atomic.Int64
-	errorLogFile    *os.File
-	successFiles    []string
-	failedFiles     []string
-	statsMutex      sync.Mutex
-	startTime       time.Time
-	totalFiles      int64
-	lastError       atomic.Value
+	errCount         atomic.Int64
+	errorLogFile     *os.File
+	successFiles     []string
+	failedFiles      []string
+	statsMutex       sync.Mutex
+	startTime        time.Time
+	totalFiles       int64
+	lastError        atomic.Value
 }
 
 func NewStats(errorLogFile *os.File, totalFiles int64) *Stats {
@@ -91,7 +91,7 @@ func displayProgress(stats *Stats, bar *progressbar.ProgressBar) {
 	speed := float64(processed) / elapsed
 
 	remaining := total - processed - errors
-	eta := time.Duration(float64(remaining) / speed) * time.Second
+	eta := time.Duration(float64(remaining)/speed) * time.Second
 
 	percentage := float64(processed+errors) / float64(total) * 100
 
@@ -166,7 +166,7 @@ func initDB(dbFile string) (*sql.DB, error) {
 	}
 
 	// Set connection pool settings
-	db.SetMaxOpenConns(1)  // SQLite only supports one writer at a time
+	db.SetMaxOpenConns(1) // SQLite only supports one writer at a time
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 
@@ -556,7 +556,6 @@ func main() {
 	moveCmd.IntVar(&moveConfig.maxRetries, "max-retries", 3, "Maximum number of retries for operations")
 	moveCmd.StringVar(&moveConfig.dbFile, "db-file", "", "Path to SQLite database file")
 	moveCmd.StringVar(&moveConfig.projectName, "project-name", "", "Project name to process from database")
-	moveCmd.StringVar(&moveConfig.alias, "alias", "", "MinIO alias for mc command")
 	moveCmd.BoolVar(&moveConfig.debug, "debug", false, "Enable debug logging")
 
 	cleanupConfig := Config{}
@@ -595,8 +594,7 @@ func main() {
 
 func runCleanup(config Config) error {
 	// Validate cleanup command flags
-	if config.endpoint == "" || config.accessKeyID == "" || config.secretAccessKey == "" ||
-		config.bucket == "" || config.dbFile == "" || config.sourceFolder == "" || config.projectName == "" ||
+	if config.bucket == "" || config.dbFile == "" || config.sourceFolder == "" || config.projectName == "" ||
 		config.alias == "" {
 		return fmt.Errorf("all parameters are required")
 	}
@@ -605,18 +603,10 @@ func runCleanup(config Config) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	minioClient, err := minio.New(config.endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(config.accessKeyID, config.secretAccessKey, ""),
-		Secure: config.useSSL,
-	})
-	if err != nil {
-		return fmt.Errorf("error creating MinIO client: %v", err)
-	}
-
 	startTime := time.Now()
 	fmt.Println("Starting version cleanup...")
 
-	err = cleanupVersions(ctx, minioClient, config.bucket, config)
+	err := cleanupVersions(ctx, config)
 	if err != nil {
 		return fmt.Errorf("error during cleanup: %v", err)
 	}
@@ -625,7 +615,7 @@ func runCleanup(config Config) error {
 	return nil
 }
 
-func cleanupVersions(ctx context.Context, client *minio.Client, bucket string, config Config) error {
+func cleanupVersions(ctx context.Context, config Config) error {
 	db, err := initDB(config.dbFile)
 	if err != nil {
 		return fmt.Errorf("failed to initialize database: %v", err)
