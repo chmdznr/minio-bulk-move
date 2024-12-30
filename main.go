@@ -57,7 +57,7 @@ type Stats struct {
 func NewStats(errorLogFile *os.File, totalFiles int64) *Stats {
 	s := &Stats{
 		errorLogFile: errorLogFile,
-		successChan:  make(chan string, 100000),
+		successChan:  make(chan string, 500000), // Increase buffer to 500k
 		startTime:    time.Now(),
 		totalFiles:   totalFiles,
 	}
@@ -169,9 +169,14 @@ func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string
 	}
 	defer db.Close()
 
-	// Set busy timeout to avoid database locked errors
-	if _, err := db.Exec("PRAGMA busy_timeout = 10000"); err != nil {
-		return fmt.Errorf("error setting busy timeout: %v", err)
+	// Set busy timeout and optimize for bulk inserts
+	if _, err := db.Exec(`
+		PRAGMA busy_timeout = 30000;
+		PRAGMA synchronous = NORMAL;
+		PRAGMA journal_mode = WAL;
+		PRAGMA temp_store = MEMORY;
+	`); err != nil {
+		return fmt.Errorf("error setting database optimizations: %v", err)
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -187,7 +192,6 @@ func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string
 	defer stmt.Close()
 
 	for _, sourceKey := range sourceKeys {
-		// Extract id_file from the sourceKey (e.g., download/U-202304010000087809807 -> U-202304010000087809807)
 		idFile := path.Base(sourceKey)
 		_, err = stmt.ExecContext(ctx, idFile)
 		if err != nil {
@@ -204,11 +208,12 @@ func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string
 }
 
 func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond) // Process every 100ms
 	defer ticker.Stop()
 
 	var batch []string
-	batchSize := 1000 // Match the command line batch size
+	batchSize := 5000 // Process larger batches
+	lastUpdate := time.Now()
 
 	for {
 		select {
@@ -223,20 +228,51 @@ func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
 			return
 		case sourceKey := <-stats.successChan:
 			batch = append(batch, sourceKey)
-			if len(batch) >= batchSize {
+			
+			// Process if batch is full or if it's been more than 500ms since last update
+			if len(batch) >= batchSize || (len(batch) > 0 && time.Since(lastUpdate) > 500*time.Millisecond) {
 				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
 					log.Printf("Error marking batch for cleanup: %v", err)
 					stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
+				} else {
+					lastUpdate = time.Now()
 				}
 				batch = batch[:0]
 			}
 		case <-ticker.C:
-			if len(batch) > 0 {
+			// Process any remaining items in batch
+			if len(batch) > 0 && time.Since(lastUpdate) > 100*time.Millisecond {
 				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
 					log.Printf("Error marking batch for cleanup: %v", err)
 					stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
+				} else {
+					lastUpdate = time.Now()
 				}
 				batch = batch[:0]
+			}
+
+			// Try to drain the channel if it's getting full
+			if len(stats.successChan) > 400000 { // If channel is more than 80% full
+				drainBatch := make([]string, 0, batchSize)
+				draining := true
+				
+				for draining && len(drainBatch) < batchSize {
+					select {
+					case sourceKey := <-stats.successChan:
+						drainBatch = append(drainBatch, sourceKey)
+					default:
+						draining = false
+					}
+				}
+
+				if len(drainBatch) > 0 {
+					if err := markFilesForCleanup(ctx, drainBatch, dbFile); err != nil {
+						log.Printf("Error marking drain batch for cleanup: %v", err)
+						stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
+					} else {
+						lastUpdate = time.Now()
+					}
+				}
 			}
 		}
 	}
