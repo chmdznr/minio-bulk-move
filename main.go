@@ -48,7 +48,9 @@ type Stats struct {
 	processedObjects atomic.Int64
 	errCount        atomic.Int64
 	errorLogFile    *os.File
-	successChan     chan string
+	successFiles    []string
+	failedFiles     []string
+	statsMutex      sync.Mutex
 	startTime       time.Time
 	totalFiles      int64
 	lastError       atomic.Value
@@ -57,12 +59,28 @@ type Stats struct {
 func NewStats(errorLogFile *os.File, totalFiles int64) *Stats {
 	s := &Stats{
 		errorLogFile: errorLogFile,
-		successChan:  make(chan string, 500000), // Increase buffer to 500k
+		successFiles: make([]string, 0, totalFiles),
+		failedFiles:  make([]string, 0),
 		startTime:    time.Now(),
 		totalFiles:   totalFiles,
 	}
 	s.lastError.Store("")
 	return s
+}
+
+func (s *Stats) AddSuccessFile(file string) {
+	s.statsMutex.Lock()
+	s.successFiles = append(s.successFiles, file)
+	s.statsMutex.Unlock()
+	s.processedObjects.Add(1)
+}
+
+func (s *Stats) AddFailedFile(file string) {
+	s.statsMutex.Lock()
+	s.failedFiles = append(s.failedFiles, file)
+	s.statsMutex.Unlock()
+	s.errCount.Add(1)
+	s.processedObjects.Add(1)
 }
 
 func displayProgress(stats *Stats, bar *progressbar.ProgressBar) {
@@ -162,119 +180,6 @@ func initDB(dbFile string) (*sql.DB, error) {
 	return db, nil
 }
 
-func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string) error {
-	db, err := sql.Open("sqlite3", dbFile)
-	if err != nil {
-		return fmt.Errorf("error opening database: %v", err)
-	}
-	defer db.Close()
-
-	// Set busy timeout and optimize for bulk inserts
-	if _, err := db.Exec(`
-		PRAGMA busy_timeout = 30000;
-		PRAGMA synchronous = NORMAL;
-		PRAGMA journal_mode = WAL;
-		PRAGMA temp_store = MEMORY;
-	`); err != nil {
-		return fmt.Errorf("error setting database optimizations: %v", err)
-	}
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("error starting transaction: %v", err)
-	}
-
-	stmt, err := tx.PrepareContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?")
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("error preparing statement: %v", err)
-	}
-	defer stmt.Close()
-
-	for _, sourceKey := range sourceKeys {
-		idFile := path.Base(sourceKey)
-		_, err = stmt.ExecContext(ctx, idFile)
-		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("error updating status for %s: %v", idFile, err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("error committing transaction: %v", err)
-	}
-
-	return nil
-}
-
-func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
-	ticker := time.NewTicker(50 * time.Millisecond) // Process every 50ms
-	defer ticker.Stop()
-
-	var batch []string
-	batchSize := 5000 // Process larger batches
-	lastUpdate := time.Now()
-
-	for {
-		select {
-		case <-ctx.Done():
-			if len(batch) > 0 {
-				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
-					log.Printf("Error marking final batch for cleanup: %v", err)
-					stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
-				}
-			}
-			return
-		case sourceKey := <-stats.successChan:
-			batch = append(batch, sourceKey)
-			
-			if len(batch) >= batchSize || (len(batch) > 0 && time.Since(lastUpdate) > 200*time.Millisecond) {
-				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
-					log.Printf("Error marking batch for cleanup: %v", err)
-					stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
-				} else {
-					lastUpdate = time.Now()
-				}
-				batch = batch[:0]
-			}
-		case <-ticker.C:
-			if len(batch) > 0 && time.Since(lastUpdate) > 50*time.Millisecond {
-				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
-					log.Printf("Error marking batch for cleanup: %v", err)
-					stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
-				} else {
-					lastUpdate = time.Now()
-				}
-				batch = batch[:0]
-			}
-
-			// Try to drain the channel if it's getting full
-			if len(stats.successChan) > 400000 {
-				drainBatch := make([]string, 0, batchSize*2) // Double batch size for draining
-				draining := true
-				
-				for draining && len(drainBatch) < batchSize*2 {
-					select {
-					case sourceKey := <-stats.successChan:
-						drainBatch = append(drainBatch, sourceKey)
-					default:
-						draining = false
-					}
-				}
-
-				if len(drainBatch) > 0 {
-					if err := markFilesForCleanup(ctx, drainBatch, dbFile); err != nil {
-						log.Printf("Error marking drain batch for cleanup: %v", err)
-						stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
-					} else {
-						lastUpdate = time.Now()
-					}
-				}
-			}
-		}
-	}
-}
-
 func worker(ctx context.Context, client *minio.Client, bucket string, workChan <-chan FileOp,
 	wg *sync.WaitGroup, stats *Stats, config Config) {
 	defer wg.Done()
@@ -299,24 +204,12 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 		return
 	}
 
-	// Create a local batch for successful operations
-	localBatch := make([]string, 0, 1000)
-	lastBatchUpdate := time.Now()
-
 	for {
 		select {
 		case <-ctx.Done():
-			// Process any remaining items in local batch
-			if len(localBatch) > 0 {
-				processLocalBatch(ctx, localBatch, stats, config.dbFile)
-			}
 			return
 		case work, ok := <-workChan:
 			if !ok {
-				// Process any remaining items in local batch
-				if len(localBatch) > 0 {
-					processLocalBatch(ctx, localBatch, stats, config.dbFile)
-				}
 				return
 			}
 
@@ -353,8 +246,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				if err != nil {
 					if strings.Contains(err.Error(), "The specified key does not exist") {
 						logError(stats.errorLogFile, work.sourceKey, "File does not exist in MinIO")
-						stats.errCount.Add(1)
-						stats.processedObjects.Add(1)
+						stats.AddFailedFile(work.sourceKey)
 						stats.lastError.Store(fmt.Sprintf("Not Found: %s", work.sourceKey))
 						success = true // Mark as success to avoid retries
 						break
@@ -366,16 +258,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				}
 				debugLog(config, "Copy successful for %s (took %v)", work.sourceKey, elapsed)
 
-				// Add to local batch instead of sending directly to channel
-				localBatch = append(localBatch, work.sourceKey)
-				
-				// Process local batch if it's full or if enough time has passed
-				if len(localBatch) >= 1000 || time.Since(lastBatchUpdate) >= 200*time.Millisecond {
-					processLocalBatch(ctx, localBatch, stats, config.dbFile)
-					localBatch = localBatch[:0]
-					lastBatchUpdate = time.Now()
-				}
-
+				stats.AddSuccessFile(work.sourceKey)
 				success = true
 				break
 			}
@@ -383,92 +266,82 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 			if !success {
 				log.Printf("Failed to process %s after retries: %v", work.sourceKey, lastErr)
 				logError(stats.errorLogFile, work.sourceKey, lastErr.Error())
-				stats.errCount.Add(1)
+				stats.AddFailedFile(work.sourceKey)
 				stats.lastError.Store(fmt.Sprintf("Failed: %v", lastErr))
 			}
-
-			stats.processedObjects.Add(1)
 		}
 	}
 }
 
-func processLocalBatch(ctx context.Context, batch []string, stats *Stats, dbFile string) {
-	// Try to update database directly first
-	if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
-		log.Printf("Error updating database directly: %v", err)
-		stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
-		
-		// If direct update fails, try sending to channel
-		for _, sourceKey := range batch {
-			select {
-			case stats.successChan <- sourceKey:
-				// Successfully queued
-			default:
-				// Channel is full, log the error but don't stop processing
-				log.Printf("Warning: success channel full, skipping database update for %s", sourceKey)
-				stats.lastError.Store("Warning: Database update queue full - retrying directly")
-				
-				// Try one more time to update directly
-				if err := markFilesForCleanup(ctx, []string{sourceKey}, dbFile); err != nil {
-					log.Printf("Error in final attempt to update database for %s: %v", sourceKey, err)
-					stats.lastError.Store(fmt.Sprintf("Final DB Error: %v", err))
-				}
+func updateDatabase(ctx context.Context, successFiles []string, dbFile string) error {
+	if len(successFiles) == 0 {
+		return nil
+	}
+
+	db, err := sql.Open("sqlite3", dbFile)
+	if err != nil {
+		return fmt.Errorf("error opening database: %v", err)
+	}
+	defer db.Close()
+
+	// Set database optimizations
+	if _, err := db.Exec(`
+		PRAGMA busy_timeout = 30000;
+		PRAGMA synchronous = NORMAL;
+		PRAGMA journal_mode = WAL;
+		PRAGMA temp_store = MEMORY;
+	`); err != nil {
+		return fmt.Errorf("error setting database optimizations: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("error starting transaction: %v", err)
+	}
+
+	stmt, err := tx.PrepareContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?")
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("error preparing statement: %v", err)
+	}
+	defer stmt.Close()
+
+	// Update in batches of 1000
+	batchSize := 1000
+	for i := 0; i < len(successFiles); i += batchSize {
+		end := i + batchSize
+		if end > len(successFiles) {
+			end = len(successFiles)
+		}
+
+		for _, sourceKey := range successFiles[i:end] {
+			idFile := path.Base(sourceKey)
+			if _, err := stmt.ExecContext(ctx, idFile); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("error updating status for %s: %v", idFile, err)
+			}
+		}
+
+		// Commit each batch
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("error committing batch: %v", err)
+		}
+
+		// Start new transaction for next batch
+		if end < len(successFiles) {
+			tx, err = db.BeginTx(ctx, nil)
+			if err != nil {
+				return fmt.Errorf("error starting transaction: %v", err)
+			}
+			stmt, err = tx.PrepareContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?")
+			if err != nil {
+				tx.Rollback()
+				return fmt.Errorf("error preparing statement: %v", err)
 			}
 		}
 	}
-}
 
-func main() {
-	moveCmd := flag.NewFlagSet("move", flag.ExitOnError)
-	cleanupCmd := flag.NewFlagSet("cleanup", flag.ExitOnError)
-
-	moveConfig := Config{}
-	moveCmd.StringVar(&moveConfig.endpoint, "endpoint", "", "MinIO server endpoint")
-	moveCmd.StringVar(&moveConfig.accessKeyID, "access-key", "", "MinIO access key")
-	moveCmd.StringVar(&moveConfig.secretAccessKey, "secret-key", "", "MinIO secret key")
-	moveCmd.BoolVar(&moveConfig.useSSL, "use-ssl", false, "Use SSL for MinIO connection")
-	moveCmd.StringVar(&moveConfig.bucket, "bucket", "", "Source bucket name")
-	moveCmd.StringVar(&moveConfig.sourceFolder, "source-folder", "", "Source folder path in bucket")
-	moveCmd.IntVar(&moveConfig.workers, "workers", 10, "Number of concurrent workers")
-	moveCmd.IntVar(&moveConfig.batchSize, "batch-size", 1000, "Number of files to process per batch")
-	moveCmd.IntVar(&moveConfig.maxRetries, "max-retries", 3, "Maximum number of retries for operations")
-	moveCmd.StringVar(&moveConfig.dbFile, "db-file", "", "Path to SQLite database file")
-	moveCmd.StringVar(&moveConfig.projectName, "project-name", "", "Project name to process from database")
-	moveCmd.StringVar(&moveConfig.alias, "alias", "", "MinIO alias for mc command")
-	moveCmd.BoolVar(&moveConfig.debug, "debug", false, "Enable debug logging")
-
-	cleanupConfig := Config{}
-	cleanupCmd.StringVar(&cleanupConfig.bucket, "bucket", "", "MinIO bucket name")
-	cleanupCmd.StringVar(&cleanupConfig.sourceFolder, "source-folder", "", "Source folder path in bucket")
-	cleanupCmd.IntVar(&cleanupConfig.batchSize, "batch-size", 1000, "Number of files to process per batch")
-	cleanupCmd.StringVar(&cleanupConfig.dbFile, "db-file", "", "Path to SQLite database file")
-	cleanupCmd.StringVar(&cleanupConfig.projectName, "project-name", "", "Project name to process from database")
-	cleanupCmd.StringVar(&cleanupConfig.alias, "alias", "", "MinIO alias for mc command")
-	cleanupCmd.BoolVar(&cleanupConfig.debug, "debug", false, "Enable debug logging")
-
-	if len(os.Args) < 2 {
-		fmt.Println("Expected 'move' or 'cleanup' subcommands")
-		fmt.Println("\nUsage:")
-		fmt.Println("  move     - Move files and mark for version cleanup")
-		fmt.Println("  cleanup  - Clean up versions of previously moved files")
-		os.Exit(1)
-	}
-
-	switch os.Args[1] {
-	case "move":
-		moveCmd.Parse(os.Args[2:])
-		if err := runMove(moveConfig); err != nil {
-			log.Fatal(err)
-		}
-	case "cleanup":
-		cleanupCmd.Parse(os.Args[2:])
-		if err := runCleanup(cleanupConfig); err != nil {
-			log.Fatal(err)
-		}
-	default:
-		fmt.Printf("%q is not valid command.\n", os.Args[1])
-		os.Exit(2)
-	}
+	return nil
 }
 
 func runMove(config Config) error {
@@ -534,24 +407,6 @@ func runMove(config Config) error {
 	bar := showProgress(stats, totalCount)
 	defer bar.Close()
 
-	// Start database update processor
-	go processDatabaseUpdates(ctx, stats, config.dbFile)
-
-	// Start progress updater
-	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				displayProgress(stats, bar)
-			}
-		}
-	}()
-
 	// Start workers
 	debugLog(config, "Starting %d workers", config.workers)
 	for i := 0; i < config.workers; i++ {
@@ -569,42 +424,41 @@ func runMove(config Config) error {
 	debugLog(config, "Waiting for workers to finish")
 	wg.Wait()
 
+	// Update database with successful files
+	if err := updateDatabase(ctx, stats.successFiles, config.dbFile); err != nil {
+		return fmt.Errorf("error updating database: %v", err)
+	}
+
+	// Log failed files
+	if len(stats.failedFiles) > 0 {
+		log.Printf("Failed to process %d files:", len(stats.failedFiles))
+		for _, file := range stats.failedFiles {
+			log.Printf("  - %s", file)
+		}
+	}
+
 	debugLog(config, "Move operation completed. Total: %d, Processed: %d, Errors: %d",
 		totalCount, stats.processedObjects.Load(), stats.errCount.Load())
 
 	return nil
 }
 
-func runCleanup(config Config) error {
-	// Validate cleanup command flags
-	if config.endpoint == "" || config.accessKeyID == "" || config.secretAccessKey == "" ||
-		config.bucket == "" || config.dbFile == "" || config.sourceFolder == "" || config.projectName == "" ||
-		config.alias == "" {
-		return fmt.Errorf("all parameters are required")
-	}
-
-	ctx := context.Background()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	minioClient, err := minio.New(config.endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(config.accessKeyID, config.secretAccessKey, ""),
-		Secure: config.useSSL,
-	})
-	if err != nil {
-		return fmt.Errorf("error creating MinIO client: %v", err)
-	}
-
-	startTime := time.Now()
-	fmt.Println("Starting version cleanup...")
-
-	err = cleanupVersions(ctx, minioClient, config.bucket, config)
-	if err != nil {
-		return fmt.Errorf("error during cleanup: %v", err)
-	}
-
-	fmt.Printf("\nCleanup completed in %v\n", time.Since(startTime))
-	return nil
+func showProgress(stats *Stats, totalFiles int64) *progressbar.ProgressBar {
+	return progressbar.NewOptions64(
+		totalFiles,
+		progressbar.OptionSetDescription("Processing files..."),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionShowBytes(false),
+		progressbar.OptionSetWidth(100),
+		progressbar.OptionThrottle(100*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(os.Stderr, "\n")
+		}),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionFullWidth(),
+		progressbar.OptionSetRenderBlankState(true),
+	)
 }
 
 func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan chan<- FileOp, stats *Stats) {
@@ -674,22 +528,89 @@ func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan
 	}
 }
 
-func showProgress(stats *Stats, totalFiles int64) *progressbar.ProgressBar {
-	return progressbar.NewOptions64(
-		totalFiles,
-		progressbar.OptionSetDescription("Processing files..."),
-		progressbar.OptionSetWriter(os.Stderr),
-		progressbar.OptionShowBytes(false),
-		progressbar.OptionSetWidth(100),
-		progressbar.OptionThrottle(100*time.Millisecond),
-		progressbar.OptionShowCount(),
-		progressbar.OptionOnCompletion(func() {
-			fmt.Fprint(os.Stderr, "\n")
-		}),
-		progressbar.OptionSpinnerType(14),
-		progressbar.OptionFullWidth(),
-		progressbar.OptionSetRenderBlankState(true),
-	)
+func main() {
+	moveCmd := flag.NewFlagSet("move", flag.ExitOnError)
+	cleanupCmd := flag.NewFlagSet("cleanup", flag.ExitOnError)
+
+	moveConfig := Config{}
+	moveCmd.StringVar(&moveConfig.endpoint, "endpoint", "", "MinIO server endpoint")
+	moveCmd.StringVar(&moveConfig.accessKeyID, "access-key", "", "MinIO access key")
+	moveCmd.StringVar(&moveConfig.secretAccessKey, "secret-key", "", "MinIO secret key")
+	moveCmd.BoolVar(&moveConfig.useSSL, "use-ssl", false, "Use SSL for MinIO connection")
+	moveCmd.StringVar(&moveConfig.bucket, "bucket", "", "Source bucket name")
+	moveCmd.StringVar(&moveConfig.sourceFolder, "source-folder", "", "Source folder path in bucket")
+	moveCmd.IntVar(&moveConfig.workers, "workers", 10, "Number of concurrent workers")
+	moveCmd.IntVar(&moveConfig.batchSize, "batch-size", 1000, "Number of files to process per batch")
+	moveCmd.IntVar(&moveConfig.maxRetries, "max-retries", 3, "Maximum number of retries for operations")
+	moveCmd.StringVar(&moveConfig.dbFile, "db-file", "", "Path to SQLite database file")
+	moveCmd.StringVar(&moveConfig.projectName, "project-name", "", "Project name to process from database")
+	moveCmd.StringVar(&moveConfig.alias, "alias", "", "MinIO alias for mc command")
+	moveCmd.BoolVar(&moveConfig.debug, "debug", false, "Enable debug logging")
+
+	cleanupConfig := Config{}
+	cleanupCmd.StringVar(&cleanupConfig.bucket, "bucket", "", "MinIO bucket name")
+	cleanupCmd.StringVar(&cleanupConfig.sourceFolder, "source-folder", "", "Source folder path in bucket")
+	cleanupCmd.IntVar(&cleanupConfig.batchSize, "batch-size", 1000, "Number of files to process per batch")
+	cleanupCmd.StringVar(&cleanupConfig.dbFile, "db-file", "", "Path to SQLite database file")
+	cleanupCmd.StringVar(&cleanupConfig.projectName, "project-name", "", "Project name to process from database")
+	cleanupCmd.StringVar(&cleanupConfig.alias, "alias", "", "MinIO alias for mc command")
+	cleanupCmd.BoolVar(&cleanupConfig.debug, "debug", false, "Enable debug logging")
+
+	if len(os.Args) < 2 {
+		fmt.Println("Expected 'move' or 'cleanup' subcommands")
+		fmt.Println("\nUsage:")
+		fmt.Println("  move     - Move files and mark for version cleanup")
+		fmt.Println("  cleanup  - Clean up versions of previously moved files")
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "move":
+		moveCmd.Parse(os.Args[2:])
+		if err := runMove(moveConfig); err != nil {
+			log.Fatal(err)
+		}
+	case "cleanup":
+		cleanupCmd.Parse(os.Args[2:])
+		if err := runCleanup(cleanupConfig); err != nil {
+			log.Fatal(err)
+		}
+	default:
+		fmt.Printf("%q is not valid command.\n", os.Args[1])
+		os.Exit(2)
+	}
+}
+
+func runCleanup(config Config) error {
+	// Validate cleanup command flags
+	if config.endpoint == "" || config.accessKeyID == "" || config.secretAccessKey == "" ||
+		config.bucket == "" || config.dbFile == "" || config.sourceFolder == "" || config.projectName == "" ||
+		config.alias == "" {
+		return fmt.Errorf("all parameters are required")
+	}
+
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	minioClient, err := minio.New(config.endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(config.accessKeyID, config.secretAccessKey, ""),
+		Secure: config.useSSL,
+	})
+	if err != nil {
+		return fmt.Errorf("error creating MinIO client: %v", err)
+	}
+
+	startTime := time.Now()
+	fmt.Println("Starting version cleanup...")
+
+	err = cleanupVersions(ctx, minioClient, config.bucket, config)
+	if err != nil {
+		return fmt.Errorf("error during cleanup: %v", err)
+	}
+
+	fmt.Printf("\nCleanup completed in %v\n", time.Since(startTime))
+	return nil
 }
 
 func cleanupVersions(ctx context.Context, client *minio.Client, bucket string, config Config) error {
