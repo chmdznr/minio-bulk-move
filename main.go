@@ -214,17 +214,17 @@ func main() {
 	cleanupCmd.StringVar(&cleanupConfig.endpoint, "endpoint", "", "MinIO server endpoint")
 	cleanupCmd.StringVar(&cleanupConfig.accessKeyID, "access-key", "", "MinIO access key")
 	cleanupCmd.StringVar(&cleanupConfig.secretAccessKey, "secret-key", "", "MinIO secret key")
+	cleanupCmd.BoolVar(&cleanupConfig.useSSL, "use-ssl", false, "Use SSL for MinIO connection")
 	cleanupCmd.StringVar(&cleanupConfig.bucket, "bucket", "", "Source bucket name")
 	cleanupCmd.StringVar(&cleanupConfig.sourceFolder, "source-folder", "", "Source folder path in bucket")
 	cleanupCmd.IntVar(&cleanupConfig.batchSize, "batch-size", 1000, "Number of files to process per batch")
 	cleanupCmd.StringVar(&cleanupConfig.dbFile, "db-file", "", "Path to SQLite database file")
 	cleanupCmd.StringVar(&cleanupConfig.projectName, "project-name", "", "Project name to process from database")
 	cleanupCmd.StringVar(&cleanupConfig.alias, "alias", "", "MinIO alias for mc command")
-	cleanupCmd.BoolVar(&cleanupConfig.useSSL, "use-ssl", false, "Use SSL for MinIO connection")
 	cleanupCmd.BoolVar(&cleanupConfig.debug, "debug", false, "Enable debug logging")
 
 	if len(os.Args) < 2 {
-		fmt.Println("Expected 'move' or 'cleanup' subcommand")
+		fmt.Println("Expected 'move' or 'cleanup' subcommands")
 		fmt.Println("\nUsage:")
 		fmt.Println("  move     - Move files and mark for version cleanup")
 		fmt.Println("  cleanup  - Clean up versions of previously moved files")
@@ -234,90 +234,107 @@ func main() {
 	switch os.Args[1] {
 	case "move":
 		moveCmd.Parse(os.Args[2:])
-		runMove(moveConfig)
+		if err := runMove(moveConfig); err != nil {
+			log.Fatal(err)
+		}
 	case "cleanup":
 		cleanupCmd.Parse(os.Args[2:])
-		runCleanup(cleanupConfig)
+		if err := runCleanup(cleanupConfig); err != nil {
+			log.Fatal(err)
+		}
 	default:
-		fmt.Printf("%q is not a valid command.\n", os.Args[1])
-		os.Exit(1)
+		fmt.Printf("%q is not valid command.\n", os.Args[1])
+		os.Exit(2)
 	}
 }
 
-func runMove(config Config) {
+func runMove(config Config) error {
+	debugLog(config, "Starting move operation with config: %+v", config)
+
+	// Validate required fields
 	if config.endpoint == "" || config.accessKeyID == "" || config.secretAccessKey == "" ||
-		config.bucket == "" || config.dbFile == "" || config.projectName == "" {
-		log.Fatal("All required flags must be provided")
+		config.bucket == "" || config.sourceFolder == "" || config.dbFile == "" || config.projectName == "" {
+		return fmt.Errorf("all parameters are required")
 	}
 
-	ctx := context.Background()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
+	// Initialize MinIO client
 	minioClient, err := minio.New(config.endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(config.accessKeyID, config.secretAccessKey, ""),
 		Secure: config.useSSL,
 	})
 	if err != nil {
-		log.Fatalf("Error creating MinIO client: %v", err)
+		return fmt.Errorf("error creating MinIO client: %v", err)
 	}
+	debugLog(config, "MinIO client initialized successfully")
 
-	stats := &Stats{
-		startTime: time.Now(),
-	}
-
-	errorLogFile, err := createErrorLogFile(config.projectName)
+	// Create error log file
+	errorLogFile, err := os.OpenFile("error.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Fatalf("Error creating error log file: %v", err)
+		return fmt.Errorf("error creating error log file: %v", err)
 	}
 	defer errorLogFile.Close()
-	stats.errorLogFile = errorLogFile
 
+	// Initialize stats
+	stats := &Stats{
+		errorLogFile: errorLogFile,
+	}
+
+	// Initialize context
+	ctx := context.Background()
+
+	// Initialize database
 	dbPool, err = initDB(config.dbFile)
 	if err != nil {
-		log.Fatalf("Error initializing database: %v", err)
+		return fmt.Errorf("error initializing database: %v", err)
 	}
 	defer dbPool.Close()
+	debugLog(config, "Database initialized successfully")
 
 	// Get total count first
 	var totalCount int64
 	err = dbPool.QueryRow("SELECT COUNT(*) FROM files WHERE project_name = ? AND status = 'uploaded'", config.projectName).Scan(&totalCount)
 	if err != nil {
-		log.Fatalf("Error getting total count: %v", err)
+		return fmt.Errorf("error getting total count: %v", err)
 	}
-	stats.totalInDB = totalCount
+	debugLog(config, "Found %d files to process", totalCount)
 
+	// Initialize work channel and wait group
 	workChan := make(chan FileOp, config.batchSize)
-
 	var wg sync.WaitGroup
+
+	// Start progress bar
+	bar := showProgress(stats, totalCount)
+	defer bar.Close()
+
+	// Start workers
+	debugLog(config, "Starting %d workers", config.workers)
 	for i := 0; i < config.workers; i++ {
 		wg.Add(1)
 		go worker(ctx, minioClient, config.bucket, workChan, &wg, stats, config)
 	}
 
-	bar := showProgress(stats, totalCount)
-	defer bar.Close()
-
-	checkDatabase(dbPool, config)
-
+	// Process files from database
+	debugLog(config, "Starting to process files from database")
 	processFilesFromDB(ctx, dbPool, config, workChan, stats)
+	debugLog(config, "Finished reading files from database")
 
+	// Close work channel and wait for workers to finish
 	close(workChan)
+	debugLog(config, "Waiting for workers to finish")
 	wg.Wait()
 
-	fmt.Printf("\nOperation completed in %v\n", time.Since(stats.startTime))
-	fmt.Printf("Total files: %d\n", totalCount)
-	fmt.Printf("Processed: %d files\n", stats.processedObjects.Load())
-	fmt.Printf("Errors: %d\n", stats.errCount.Load())
-	fmt.Printf("Skipped: %d\n", stats.skippedCount.Load())
+	debugLog(config, "Move operation completed. Total: %d, Processed: %d, Errors: %d, Skipped: %d",
+		stats.totalInDB, stats.processedObjects.Load(), stats.errCount.Load(), stats.skippedCount.Load())
+
+	return nil
 }
 
-func runCleanup(config Config) {
+func runCleanup(config Config) error {
 	// Validate cleanup command flags
 	if config.endpoint == "" || config.accessKeyID == "" || config.secretAccessKey == "" ||
 		config.bucket == "" || config.dbFile == "" || config.sourceFolder == "" || config.projectName == "" ||
 		config.alias == "" {
-		log.Fatal("All required flags must be provided")
+		return fmt.Errorf("all parameters are required")
 	}
 
 	ctx := context.Background()
@@ -329,7 +346,7 @@ func runCleanup(config Config) {
 		Secure: config.useSSL,
 	})
 	if err != nil {
-		log.Fatalf("Error creating MinIO client: %v", err)
+		return fmt.Errorf("error creating MinIO client: %v", err)
 	}
 
 	startTime := time.Now()
@@ -337,10 +354,11 @@ func runCleanup(config Config) {
 
 	err = cleanupVersions(ctx, minioClient, config.bucket, config)
 	if err != nil {
-		log.Printf("Error during cleanup: %v", err)
+		return fmt.Errorf("error during cleanup: %v", err)
 	}
 
 	fmt.Printf("\nCleanup completed in %v\n", time.Since(startTime))
+	return nil
 }
 
 func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan chan<- FileOp, stats *Stats) {
