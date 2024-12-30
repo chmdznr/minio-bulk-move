@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"strings"
@@ -126,17 +127,10 @@ func createErrorLogFile(projectName string) (*os.File, error) {
 }
 
 func logError(f *os.File, sourceKey, errMsg string) {
-	if f == nil {
-		return
-	}
-	
-	logEntry := fmt.Sprintf("[%s] File: %s - Error: %s\n",
-		time.Now().Format("2006-01-02 15:04:05"),
-		sourceKey,
-		errMsg)
-	
-	if _, err := f.WriteString(logEntry); err != nil {
-		log.Printf("Failed to write to error log: %v", err)
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	_, err := fmt.Fprintf(f, "[%s] %s: %s\n", timestamp, sourceKey, errMsg)
+	if err != nil {
+		log.Printf("Error writing to error log: %v", err)
 	}
 }
 
@@ -207,8 +201,8 @@ func main() {
 	moveCmd.IntVar(&moveConfig.maxRetries, "max-retries", 3, "Maximum number of retries for operations")
 	moveCmd.StringVar(&moveConfig.dbFile, "db-file", "", "Path to SQLite database file")
 	moveCmd.StringVar(&moveConfig.projectName, "project-name", "", "Project name to process from database")
+	moveCmd.StringVar(&moveConfig.alias, "alias", "", "MinIO alias for mc command")
 	moveCmd.BoolVar(&moveConfig.debug, "debug", false, "Enable debug logging")
-	moveConfig.alias = ""
 
 	cleanupConfig := Config{}
 	cleanupCmd.StringVar(&cleanupConfig.endpoint, "endpoint", "", "MinIO server endpoint")
@@ -258,9 +252,19 @@ func runMove(config Config) error {
 	}
 
 	// Initialize MinIO client
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   true,
+	}
+
 	minioClient, err := minio.New(config.endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(config.accessKeyID, config.secretAccessKey, ""),
-		Secure: config.useSSL,
+		Creds:     credentials.NewStaticV4(config.accessKeyID, config.secretAccessKey, ""),
+		Secure:    config.useSSL,
+		Transport: transport,
 	})
 	if err != nil {
 		return fmt.Errorf("error creating MinIO client: %v", err)
@@ -448,6 +452,25 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 	wg *sync.WaitGroup, stats *Stats, config Config) {
 	defer wg.Done()
 
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   true,
+	}
+
+	minioClient, err := minio.New(config.endpoint, &minio.Options{
+		Creds:     credentials.NewStaticV4(config.accessKeyID, config.secretAccessKey, ""),
+		Secure:    config.useSSL,
+		Transport: transport,
+	})
+	if err != nil {
+		log.Printf("Error creating MinIO client in worker: %v", err)
+		return
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -459,7 +482,11 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 
 			debugLog(config, "Processing file: %s -> %s", work.sourceKey, work.targetKey)
 
-			_, err := client.StatObject(ctx, bucket, work.sourceKey, minio.StatObjectOptions{})
+			// Create a context with timeout for each operation
+			opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			_, err := minioClient.StatObject(opCtx, bucket, work.sourceKey, minio.StatObjectOptions{})
+			cancel()
+
 			if err != nil {
 				if strings.Contains(err.Error(), "The specified key does not exist") {
 					logError(stats.errorLogFile, work.sourceKey, "File does not exist in MinIO")
@@ -467,6 +494,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 					stats.processedObjects.Add(1)
 					continue
 				}
+				debugLog(config, "StatObject error for %s: %v", work.sourceKey, err)
 			}
 
 			var lastErr error
@@ -491,16 +519,27 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				}
 
 				debugLog(config, "Copying %s to %s", work.sourceKey, work.targetKey)
-				_, err := client.CopyObject(ctx, dstOpts, srcOpts)
+				opCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				startTime := time.Now()
+				_, err := minioClient.CopyObject(opCtx, dstOpts, srcOpts)
+				elapsed := time.Since(startTime)
+				cancel()
+
 				if err != nil {
-					lastErr = fmt.Errorf("error copying: %v", err)
+					lastErr = fmt.Errorf("error copying (took %v): %v", elapsed, err)
+					debugLog(config, "Copy error for %s: %v", work.sourceKey, err)
 					continue
 				}
+				debugLog(config, "Copy successful for %s (took %v)", work.sourceKey, elapsed)
 
 				// Mark for cleanup instead of removing versions here
-				err = markFileForCleanup(ctx, work.sourceKey, config.dbFile)
+				opCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+				err = markFileForCleanup(opCtx, work.sourceKey, config.dbFile)
+				cancel()
+
 				if err != nil {
 					lastErr = fmt.Errorf("error marking for cleanup: %v", err)
+					debugLog(config, "Cleanup mark error for %s: %v", work.sourceKey, err)
 					continue
 				}
 
