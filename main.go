@@ -162,7 +162,7 @@ func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string
 		return fmt.Errorf("error starting transaction: %v", err)
 	}
 
-	stmt, err := tx.PrepareContext(ctx, "UPDATE files SET status = 'moved' WHERE path = ?")
+	stmt, err := tx.PrepareContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE path = ?")
 	if err != nil {
 		tx.Rollback()
 		return fmt.Errorf("error preparing statement: %v", err)
