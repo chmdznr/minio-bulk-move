@@ -81,115 +81,133 @@ The application supports two main commands: `move` and `cleanup`.
 
 Moves files to their new locations based on year-month pattern:
 
-```powershell
-.\minio-bulk-move.exe move `
-    -endpoint localhost:9000 `
-    -access-key YOUR_ACCESS_KEY `
-    -secret-key YOUR_SECRET_KEY `
-    -use-ssl false `
-    -bucket your-bucket `
-    -source-folder "download" `
-    -workers 10 `
-    -batch-size 1000 `
-    -max-retries 3 `
-    -db-file path/to/db.sqlite `
-    -project-name your-project `
+```bash
+./minio-bulk-move move \
+    -endpoint localhost:9000 \
+    -access-key YOUR_ACCESS_KEY \
+    -secret-key YOUR_SECRET_KEY \
+    -bucket your-bucket \
+    -source-folder "download" \
+    -workers 10 \
+    -batch-size 1000 \
+    -max-retries 3 \
+    -db-file path/to/db.sqlite \
+    -project-name your-project \
+    -use-ssl=false \
     -debug false
+
+# Parameters:
+#   -endpoint        : MinIO server endpoint
+#   -access-key      : MinIO access key
+#   -secret-key      : MinIO secret key
+#   -bucket          : Source bucket name
+#   -source-folder   : Source folder path in bucket
+#   -workers         : Number of concurrent workers (default: 10)
+#   -batch-size      : Number of files to process per batch (default: 1000)
+#   -max-retries     : Maximum number of retries for operations (default: 3)
+#   -db-file         : Path to SQLite database file
+#   -project-name    : Project name to process from database
+#   -use-ssl         : Use SSL for MinIO connection (default: false)
+#   -debug           : Enable debug logging (default: false)
 ```
 
 ### Cleanup Command
 
-Instead of directly removing versioned objects (which can be very slow with millions of files), the cleanup command generates a shell script with progress tracking:
+Generates and executes a script to clean up versioned objects:
 
-```powershell
-.\minio-bulk-move.exe cleanup `
-    -endpoint localhost:9000 `
-    -access-key YOUR_ACCESS_KEY `
-    -secret-key YOUR_SECRET_KEY `
-    -use-ssl false `
-    -bucket your-bucket `
-    -source-folder "download" `
-    -db-file path/to/db.sqlite `
-    -batch-size 1000 `
+```bash
+# Step 1: Generate cleanup script
+./minio-bulk-move cleanup \
+    -endpoint localhost:9000 \
+    -access-key YOUR_ACCESS_KEY \
+    -secret-key YOUR_SECRET_KEY \
+    -bucket your-bucket \
+    -source-folder "download" \
+    -batch-size 1000 \
+    -db-file path/to/db.sqlite \
+    -project-name your-project \
+    -alias minio \
+    -use-ssl=false \
     -debug false
+
+# Parameters:
+#   -endpoint        : MinIO server endpoint
+#   -access-key      : MinIO access key
+#   -secret-key      : MinIO secret key
+#   -bucket          : Source bucket name
+#   -source-folder   : Source folder path in bucket
+#   -batch-size      : Number of files to process per batch (default: 1000)
+#   -db-file         : Path to SQLite database file
+#   -project-name    : Project name to process from database
+#   -alias           : MinIO alias for mc command
+#   -use-ssl         : Use SSL for MinIO connection (default: false)
+#   -debug           : Enable debug logging (default: false)
+
+# Step 2: Configure MinIO Client (mc)
+mc alias set minio http://localhost:9000 YOUR_ACCESS_KEY YOUR_SECRET_KEY
+
+# Step 3: Run the cleanup script
+bash cleanup_YYYYMMDD_HHMMSS.sh
 ```
 
-This will generate a script (`cleanup_YYYYMMDD_HHMMSS.sh`) that:
-- Shows real-time progress in terminal
-- Saves progress to `cleanup_progress.log`
-- Logs errors to `cleanup_errors.log`
-- Can be interrupted and resumed
-- Tracks processing rate and ETA
-
-Example cleanup script output:
-```
-Progress: 45.2% | Processed: 452/1000 | Failed: 2 | Rate: 0.25 files/sec | ETA: 06:30:45
-```
-
-### Available Flags
-
-#### Move Command Flags
-- `-endpoint`: MinIO server endpoint (required)
-- `-access-key`: MinIO access key (required)
-- `-secret-key`: MinIO secret key (required)
-- `-use-ssl`: Use SSL for MinIO connection
-- `-bucket`: Source bucket name (required)
-- `-source-folder`: Source folder path in bucket (required)
-- `-workers`: Number of concurrent workers (default: 10)
-- `-batch-size`: Number of files to process per batch (default: 1000)
-- `-max-retries`: Maximum number of retries for operations (default: 3)
-- `-db-file`: Path to SQLite database file (required)
-- `-project-name`: Project name to process from database (required)
-- `-debug`: Enable verbose debug logging (default: false)
-
-#### Cleanup Command Flags
-- `-endpoint`: MinIO server endpoint (required)
-- `-access-key`: MinIO access key (required)
-- `-secret-key`: MinIO secret key (required)
-- `-use-ssl`: Use SSL for MinIO connection
-- `-bucket`: Source bucket name (required)
-- `-source-folder`: Source folder path in bucket (required)
-- `-db-file`: Path to SQLite database file (required)
-- `-batch-size`: Number of files to process per batch (default: 1000)
-- `-debug`: Enable verbose debug logging (default: false)
-
-## File Processing Flow
-
+The cleanup process works in two phases:
 1. **Move Operation**:
    - Reads files from SQLite database
    - Constructs new path based on year-month pattern
    - Copies file with preserved metadata to new location
-   - Removes the latest version of the source file
-   - Marks file as 'pending_cleanup' in database
+   - Marks the file for cleanup in the database
 
 2. **Cleanup Operation**:
-   - Generates a shell script to handle version cleanup
-   - Script uses MinIO Client (mc) for efficient version removal
-   - Includes progress tracking and error logging
-   - Can be run independently during off-peak hours
+   - Generates a shell script to remove versioned objects
+   - Shows real-time progress during cleanup
+   - Logs errors to cleanup_errors.log
+   - Saves progress to cleanup_progress.log
+   - Can be interrupted and resumed safely
+
+## Progress Tracking
+
+Both move and cleanup operations provide detailed progress information:
+
+1. **Move Command**:
+   - Progress bar showing percentage complete
+   - Current batch information
+   - Estimated time remaining
+   - Error count and skipped files
+   - Processing rate (files/second)
+
+2. **Cleanup Script**:
+   - Real-time progress percentage
+   - Processing rate (files/second)
+   - Estimated time remaining (ETA)
+   - Error logging with file details
+   - Progress log file for monitoring
 
 ## Error Handling
 
-- Failed moves are logged with detailed error messages
-- Failed cleanups are logged to `cleanup_errors.log`
-- All operations support configurable retries
-- Detailed error logs are saved to `logs/[project_name]_[date]_errors.log`
+- Failed operations are logged to error.log
+- Retry mechanism for transient failures
+- Detailed error messages with file paths
+- Safe to re-run operations (idempotent)
+- Cleanup script can be interrupted and resumed
 
-## Performance Considerations
+## Best Practices
 
-- Use appropriate batch size based on your system resources
-- Adjust worker count based on available CPU cores
-- Run cleanup script during off-peak hours
-- Monitor MinIO server load during bulk operations
-- Consider splitting cleanup script for parallel execution
-- Version cleanup can take several minutes per file
+1. **Database Performance**:
+   - Create appropriate indexes
+   - Regular VACUUM to optimize space
+   - Monitor database size growth
 
-## Dependencies
+2. **Resource Usage**:
+   - Adjust workers based on CPU cores
+   - Monitor memory usage with large batches
+   - Consider network bandwidth limitations
 
-- github.com/minio/minio-go/v7 - MinIO Go client
-- github.com/schollz/progressbar/v3 - Progress bar visualization
-- github.com/mattn/go-sqlite3 - SQLite driver for Go
+3. **Operation Safety**:
+   - Always backup database before operations
+   - Review cleanup script before execution
+   - Monitor error logs during processing
+   - Use debug mode for troubleshooting
 
 ## License
 
-BSD-3-Clause
+This project is licensed under the MIT License - see the LICENSE file for details.
