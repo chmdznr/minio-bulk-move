@@ -208,7 +208,7 @@ func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string
 }
 
 func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
-	ticker := time.NewTicker(100 * time.Millisecond) // Process every 100ms
+	ticker := time.NewTicker(50 * time.Millisecond) // Process every 50ms
 	defer ticker.Stop()
 
 	var batch []string
@@ -218,7 +218,6 @@ func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Process remaining files before exit
 			if len(batch) > 0 {
 				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
 					log.Printf("Error marking final batch for cleanup: %v", err)
@@ -229,8 +228,7 @@ func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
 		case sourceKey := <-stats.successChan:
 			batch = append(batch, sourceKey)
 			
-			// Process if batch is full or if it's been more than 500ms since last update
-			if len(batch) >= batchSize || (len(batch) > 0 && time.Since(lastUpdate) > 500*time.Millisecond) {
+			if len(batch) >= batchSize || (len(batch) > 0 && time.Since(lastUpdate) > 200*time.Millisecond) {
 				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
 					log.Printf("Error marking batch for cleanup: %v", err)
 					stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
@@ -240,8 +238,7 @@ func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
 				batch = batch[:0]
 			}
 		case <-ticker.C:
-			// Process any remaining items in batch
-			if len(batch) > 0 && time.Since(lastUpdate) > 100*time.Millisecond {
+			if len(batch) > 0 && time.Since(lastUpdate) > 50*time.Millisecond {
 				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
 					log.Printf("Error marking batch for cleanup: %v", err)
 					stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
@@ -252,11 +249,11 @@ func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
 			}
 
 			// Try to drain the channel if it's getting full
-			if len(stats.successChan) > 400000 { // If channel is more than 80% full
-				drainBatch := make([]string, 0, batchSize)
+			if len(stats.successChan) > 400000 {
+				drainBatch := make([]string, 0, batchSize*2) // Double batch size for draining
 				draining := true
 				
-				for draining && len(drainBatch) < batchSize {
+				for draining && len(drainBatch) < batchSize*2 {
 					select {
 					case sourceKey := <-stats.successChan:
 						drainBatch = append(drainBatch, sourceKey)
@@ -302,12 +299,24 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 		return
 	}
 
+	// Create a local batch for successful operations
+	localBatch := make([]string, 0, 1000)
+	lastBatchUpdate := time.Now()
+
 	for {
 		select {
 		case <-ctx.Done():
+			// Process any remaining items in local batch
+			if len(localBatch) > 0 {
+				processLocalBatch(ctx, localBatch, stats, config.dbFile)
+			}
 			return
 		case work, ok := <-workChan:
 			if !ok {
+				// Process any remaining items in local batch
+				if len(localBatch) > 0 {
+					processLocalBatch(ctx, localBatch, stats, config.dbFile)
+				}
 				return
 			}
 
@@ -357,12 +366,14 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				}
 				debugLog(config, "Copy successful for %s (took %v)", work.sourceKey, elapsed)
 
-				// Send successful copy to channel for batch processing
-				select {
-				case stats.successChan <- work.sourceKey:
-				default:
-					log.Printf("Warning: success channel full, skipping database update for %s", work.sourceKey)
-					stats.lastError.Store("Warning: Database update queue full")
+				// Add to local batch instead of sending directly to channel
+				localBatch = append(localBatch, work.sourceKey)
+				
+				// Process local batch if it's full or if enough time has passed
+				if len(localBatch) >= 1000 || time.Since(lastBatchUpdate) >= 200*time.Millisecond {
+					processLocalBatch(ctx, localBatch, stats, config.dbFile)
+					localBatch = localBatch[:0]
+					lastBatchUpdate = time.Now()
 				}
 
 				success = true
@@ -377,6 +388,32 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 			}
 
 			stats.processedObjects.Add(1)
+		}
+	}
+}
+
+func processLocalBatch(ctx context.Context, batch []string, stats *Stats, dbFile string) {
+	// Try to update database directly first
+	if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
+		log.Printf("Error updating database directly: %v", err)
+		stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
+		
+		// If direct update fails, try sending to channel
+		for _, sourceKey := range batch {
+			select {
+			case stats.successChan <- sourceKey:
+				// Successfully queued
+			default:
+				// Channel is full, log the error but don't stop processing
+				log.Printf("Warning: success channel full, skipping database update for %s", sourceKey)
+				stats.lastError.Store("Warning: Database update queue full - retrying directly")
+				
+				// Try one more time to update directly
+				if err := markFilesForCleanup(ctx, []string{sourceKey}, dbFile); err != nil {
+					log.Printf("Error in final attempt to update database for %s: %v", sourceKey, err)
+					stats.lastError.Store(fmt.Sprintf("Final DB Error: %v", err))
+				}
+			}
 		}
 	}
 }
@@ -401,11 +438,7 @@ func main() {
 	moveCmd.BoolVar(&moveConfig.debug, "debug", false, "Enable debug logging")
 
 	cleanupConfig := Config{}
-	cleanupCmd.StringVar(&cleanupConfig.endpoint, "endpoint", "", "MinIO server endpoint")
-	cleanupCmd.StringVar(&cleanupConfig.accessKeyID, "access-key", "", "MinIO access key")
-	cleanupCmd.StringVar(&cleanupConfig.secretAccessKey, "secret-key", "", "MinIO secret key")
-	cleanupCmd.BoolVar(&cleanupConfig.useSSL, "use-ssl", false, "Use SSL for MinIO connection")
-	cleanupCmd.StringVar(&cleanupConfig.bucket, "bucket", "", "Source bucket name")
+	cleanupCmd.StringVar(&cleanupConfig.bucket, "bucket", "", "MinIO bucket name")
 	cleanupCmd.StringVar(&cleanupConfig.sourceFolder, "source-folder", "", "Source folder path in bucket")
 	cleanupCmd.IntVar(&cleanupConfig.batchSize, "batch-size", 1000, "Number of files to process per batch")
 	cleanupCmd.StringVar(&cleanupConfig.dbFile, "db-file", "", "Path to SQLite database file")
