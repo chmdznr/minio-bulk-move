@@ -61,6 +61,11 @@ type FileMetadata struct {
 	NamaModul  string `json:"nama_modul"`
 }
 
+var (
+	dbMutex sync.Mutex
+	dbPool  *sql.DB
+)
+
 func displayProgress(stats *Stats, bar *progressbar.ProgressBar) {
 	processed := stats.processedObjects.Load()
 	errors := stats.errCount.Load()
@@ -141,6 +146,51 @@ func debugLog(config Config, format string, args ...interface{}) {
 	}
 }
 
+func initDB(dbFile string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", dbFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %v", err)
+	}
+
+	// Set connection pool settings
+	db.SetMaxOpenConns(1)  // SQLite only supports one writer at a time
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(time.Hour)
+
+	// Set busy timeout to avoid database locked errors
+	_, err = db.Exec("PRAGMA busy_timeout = 5000")
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to set busy timeout: %v", err)
+	}
+
+	return db, nil
+}
+
+func markFileForCleanup(ctx context.Context, filepath string, dbFile string) error {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	db, err := sql.Open("sqlite3", dbFile)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Set busy timeout to avoid database locked errors
+	_, err = db.Exec("PRAGMA busy_timeout = 5000")
+	if err != nil {
+		return fmt.Errorf("failed to set busy timeout: %v", err)
+	}
+
+	query := `UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?`
+	_, err = db.ExecContext(ctx, query, path.Base(filepath))
+	if err != nil {
+		return fmt.Errorf("error marking for cleanup: %v", err)
+	}
+	return nil
+}
+
 func main() {
 	moveCmd := flag.NewFlagSet("move", flag.ExitOnError)
 	cleanupCmd := flag.NewFlagSet("cleanup", flag.ExitOnError)
@@ -156,8 +206,8 @@ func main() {
 	moveCmd.IntVar(&moveConfig.batchSize, "batch-size", 1000, "Number of files to process per batch")
 	moveCmd.IntVar(&moveConfig.maxRetries, "max-retries", 3, "Maximum number of retries for operations")
 	moveCmd.StringVar(&moveConfig.dbFile, "db-file", "", "Path to SQLite database file")
-	moveCmd.StringVar(&moveConfig.projectName, "project-name", "", "Project name to process from database")
-	moveCmd.BoolVar(&moveConfig.debug, "debug", false, "Enable debug logging")
+	moveConfig.projectName = "project1"
+	moveConfig.debug = true
 
 	cleanupConfig := Config{}
 	cleanupCmd.StringVar(&cleanupConfig.endpoint, "endpoint", "", "MinIO server endpoint")
@@ -222,15 +272,15 @@ func runMove(config Config) {
 	defer errorLogFile.Close()
 	stats.errorLogFile = errorLogFile
 
-	db, err := sql.Open("sqlite3", config.dbFile)
+	dbPool, err = initDB(config.dbFile)
 	if err != nil {
-		log.Fatalf("Error opening database: %v", err)
+		log.Fatalf("Error initializing database: %v", err)
 	}
-	defer db.Close()
+	defer dbPool.Close()
 
 	// Get total count first
 	var totalCount int64
-	err = db.QueryRow("SELECT COUNT(*) FROM files WHERE project_name = ? AND status = 'uploaded'", config.projectName).Scan(&totalCount)
+	err = dbPool.QueryRow("SELECT COUNT(*) FROM files WHERE project_name = ? AND status = 'uploaded'", config.projectName).Scan(&totalCount)
 	if err != nil {
 		log.Fatalf("Error getting total count: %v", err)
 	}
@@ -251,9 +301,9 @@ func runMove(config Config) {
 	bar := showProgress(stats, totalCount)
 	defer bar.Close()
 
-	checkDatabase(db, config)
+	checkDatabase(dbPool, config)
 
-	processFilesFromDB(ctx, db, config, workChan, stats)
+	processFilesFromDB(ctx, dbPool, config, workChan, stats)
 
 	close(workChan)
 	wg.Wait()
@@ -299,243 +349,69 @@ func runCleanup(config Config) {
 func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan chan<- FileOp, stats *Stats) {
 	offset := 0
 	for {
-		query := `
-			SELECT id_file, filepath, f_metadata
-			FROM files
-			WHERE project_name = ? AND status = 'uploaded'
-			ORDER BY id
-			LIMIT ? OFFSET ?`
-
-		debugLog(config, "Running query with project_name=%s, limit=%d, offset=%d", config.projectName, config.batchSize, offset)
-
-		rows, err := db.QueryContext(ctx, query, config.projectName, config.batchSize, offset)
+		dbMutex.Lock()
+		rows, err := db.QueryContext(ctx, `
+			SELECT id_file, filepath, f_metadata 
+			FROM files 
+			WHERE project_name = ? 
+			LIMIT ? OFFSET ?`, config.projectName, config.batchSize, offset)
 		if err != nil {
-			log.Printf("Error querying database: %v", err)
+			log.Printf("Error querying files: %v", err)
+			dbMutex.Unlock()
 			return
 		}
 
-		empty := true
-		batchCount := 0
+		count := 0
 		for rows.Next() {
-			empty = false
-			batchCount++
-
 			var idFile, filepath, metadataStr string
 			if err := rows.Scan(&idFile, &filepath, &metadataStr); err != nil {
 				log.Printf("Error scanning row: %v", err)
-				stats.errCount.Add(1)
 				continue
 			}
-
-			debugLog(config, "Found record: id_file=%s, filepath=%s, metadata=%s", idFile, filepath, metadataStr)
 
 			var metadata FileMetadata
 			if err := json.Unmarshal([]byte(metadataStr), &metadata); err != nil {
-				log.Printf("Error parsing metadata for %s: %v", idFile, err)
-				stats.errCount.Add(1)
+				log.Printf("Error unmarshaling metadata for %s: %v", idFile, err)
 				continue
 			}
 
-			if len(idFile) < 9 {
-				log.Printf("Invalid id_file format: %s", idFile)
-				stats.skippedCount.Add(1)
-				continue
-			}
-
-			yearMonth := idFile[2:8] // Extract YYYYMM
-			targetKey := path.Join("download", yearMonth, path.Base(idFile))
 			sourceKey := path.Join(config.sourceFolder, idFile)
+			targetKey := path.Join(config.sourceFolder, idFile)
 
-			stats.totalObjects.Add(1)
-			stats.currentBatch = fmt.Sprintf("Batch %d-%d", offset, offset+batchCount)
-
-			select {
-			case <-ctx.Done():
-				rows.Close()
-				return
-			case workChan <- FileOp{
+			workChan <- FileOp{
 				sourceKey: sourceKey,
 				targetKey: targetKey,
-				yearMonth: yearMonth,
+				yearMonth: metadata.ExistingID[:6], // Extract YYYYMM from ExistingID
 				metadata: map[string]string{
-					"X-Amz-Meta-Original-Path": filepath,
-					"X-Amz-Meta-Module":        metadata.NamaModul,
-					"X-Amz-Meta-Original-Name": metadata.NamaFile,
+					"id_profile":     metadata.IDProfile,
+					"nama_file_asli": metadata.NamaFile,
+					"nama_modul":     metadata.NamaModul,
 				},
-			}:
 			}
+			count++
 		}
 		rows.Close()
+		dbMutex.Unlock()
 
-		if empty {
-			debugLog(config, "No more records found, exiting")
+		if count == 0 {
 			break
 		}
-
-		offset += config.batchSize
+		offset += count
 	}
-}
-
-func worker(ctx context.Context, client *minio.Client, bucket string, workChan <-chan FileOp,
-	wg *sync.WaitGroup, stats *Stats, config Config) {
-	defer wg.Done()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case work, ok := <-workChan:
-			if !ok {
-				return
-			}
-
-			debugLog(config, "Processing file: %s -> %s", work.sourceKey, work.targetKey)
-
-			_, err := client.StatObject(ctx, bucket, work.sourceKey, minio.StatObjectOptions{})
-			if err != nil {
-				if strings.Contains(err.Error(), "The specified key does not exist") {
-					logError(stats.errorLogFile, work.sourceKey, "File does not exist in MinIO")
-					stats.errCount.Add(1)
-					stats.processedObjects.Add(1)
-					continue
-				}
-			}
-
-			var lastErr error
-			success := false
-
-			for attempts := 0; attempts < config.maxRetries; attempts++ {
-				if attempts > 0 {
-					debugLog(config, "Retry %d for file %s", attempts, work.sourceKey)
-					time.Sleep(time.Second * time.Duration(attempts))
-				}
-
-				srcOpts := minio.CopySrcOptions{
-					Bucket: bucket,
-					Object: work.sourceKey,
-				}
-
-				dstOpts := minio.CopyDestOptions{
-					Bucket:          bucket,
-					Object:          work.targetKey,
-					UserMetadata:    work.metadata,
-					ReplaceMetadata: true,
-				}
-
-				debugLog(config, "Copying %s to %s", work.sourceKey, work.targetKey)
-				_, err := client.CopyObject(ctx, dstOpts, srcOpts)
-				if err != nil {
-					lastErr = fmt.Errorf("error copying: %v", err)
-					continue
-				}
-
-				// Mark for cleanup instead of removing versions here
-				err = markFileForCleanup(ctx, work.sourceKey, config.dbFile)
-				if err != nil {
-					lastErr = fmt.Errorf("error marking for cleanup: %v", err)
-					continue
-				}
-
-				success = true
-				break
-			}
-
-			if !success {
-				log.Printf("Failed to process %s after retries: %v", work.sourceKey, lastErr)
-				logError(stats.errorLogFile, work.sourceKey, lastErr.Error())
-				stats.errCount.Add(1)
-			}
-
-			stats.processedObjects.Add(1)
-		}
-	}
-}
-
-func checkDatabase(db *sql.DB, config Config) {
-	rows, err := db.Query("SELECT sql FROM sqlite_master WHERE type='table' AND name='files'")
-	if err != nil {
-		log.Printf("Error checking table schema: %v", err)
-		return
-	}
-	defer rows.Close()
-
-	if rows.Next() {
-		var tableSQL string
-		if err := rows.Scan(&tableSQL); err != nil {
-			log.Printf("Error reading table schema: %v", err)
-		} else {
-			debugLog(config, "Table schema: %s", tableSQL)
-		}
-	}
-
-	rows, err = db.Query("SELECT project_name, status, COUNT(*) FROM files GROUP BY project_name, status")
-	if err != nil {
-		log.Printf("Error getting file counts: %v", err)
-		return
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var projectName, status string
-		var count int
-		if err := rows.Scan(&projectName, &status, &count); err != nil {
-			log.Printf("Error reading count: %v", err)
-			continue
-		}
-		debugLog(config, "Project: %s, Status: %s, Count: %d", projectName, status, count)
-	}
-}
-
-func showProgress(stats *Stats, totalFiles int64) *progressbar.ProgressBar {
-	return progressbar.NewOptions64(
-		totalFiles,
-		progressbar.OptionSetDescription("Processing files..."),
-		progressbar.OptionSetWriter(os.Stderr),
-		progressbar.OptionShowBytes(false),
-		progressbar.OptionSetWidth(15),
-		progressbar.OptionThrottle(100*time.Millisecond),
-		progressbar.OptionShowCount(),
-		progressbar.OptionOnCompletion(func() {
-			fmt.Fprint(os.Stderr, "\n")
-		}),
-		progressbar.OptionSpinnerType(14),
-		progressbar.OptionFullWidth(),
-		progressbar.OptionSetRenderBlankState(true),
-		progressbar.OptionSetElapsedTime(true),
-		progressbar.OptionSetPredictTime(true),
-		progressbar.OptionShowElapsedTimeOnFinish(),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "=",
-			SaucerHead:    ">",
-			SaucerPadding: " ",
-			BarStart:      "[",
-			BarEnd:        "]",
-		}),
-	)
-}
-
-func markFileForCleanup(ctx context.Context, sourceKey string, dbFile string) error {
-	db, err := sql.Open("sqlite3", dbFile)
-	if err != nil {
-		return fmt.Errorf("failed to open database: %v", err)
-	}
-	defer db.Close()
-
-	query := `UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?`
-	_, err = db.ExecContext(ctx, query, path.Base(sourceKey))
-	return err
 }
 
 func cleanupVersions(ctx context.Context, client *minio.Client, bucket string, config Config) error {
-	db, err := sql.Open("sqlite3", config.dbFile)
+	db, err := initDB(config.dbFile)
 	if err != nil {
-		return fmt.Errorf("failed to open database: %v", err)
+		return fmt.Errorf("failed to initialize database: %v", err)
 	}
 	defer db.Close()
 
 	// Get total count first
 	var totalCount int
+	dbMutex.Lock()
 	err = db.QueryRow("SELECT COUNT(*) FROM files WHERE status = 'pending_cleanup' AND project_name = ?", config.projectName).Scan(&totalCount)
+	dbMutex.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to get total count: %v", err)
 	}
@@ -675,4 +551,142 @@ echo "See cleanup_errors.log for any errors"
 	fmt.Println("- Can be interrupted and resumed")
 
 	return nil
+}
+
+func worker(ctx context.Context, client *minio.Client, bucket string, workChan <-chan FileOp,
+	wg *sync.WaitGroup, stats *Stats, config Config) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case work, ok := <-workChan:
+			if !ok {
+				return
+			}
+
+			debugLog(config, "Processing file: %s -> %s", work.sourceKey, work.targetKey)
+
+			_, err := client.StatObject(ctx, bucket, work.sourceKey, minio.StatObjectOptions{})
+			if err != nil {
+				if strings.Contains(err.Error(), "The specified key does not exist") {
+					logError(stats.errorLogFile, work.sourceKey, "File does not exist in MinIO")
+					stats.errCount.Add(1)
+					stats.processedObjects.Add(1)
+					continue
+				}
+			}
+
+			var lastErr error
+			success := false
+
+			for attempts := 0; attempts < config.maxRetries; attempts++ {
+				if attempts > 0 {
+					debugLog(config, "Retry %d for file %s", attempts, work.sourceKey)
+					time.Sleep(time.Second * time.Duration(attempts))
+				}
+
+				srcOpts := minio.CopySrcOptions{
+					Bucket: bucket,
+					Object: work.sourceKey,
+				}
+
+				dstOpts := minio.CopyDestOptions{
+					Bucket:          bucket,
+					Object:          work.targetKey,
+					UserMetadata:    work.metadata,
+					ReplaceMetadata: true,
+				}
+
+				debugLog(config, "Copying %s to %s", work.sourceKey, work.targetKey)
+				_, err := client.CopyObject(ctx, dstOpts, srcOpts)
+				if err != nil {
+					lastErr = fmt.Errorf("error copying: %v", err)
+					continue
+				}
+
+				// Mark for cleanup instead of removing versions here
+				err = markFileForCleanup(ctx, work.sourceKey, config.dbFile)
+				if err != nil {
+					lastErr = fmt.Errorf("error marking for cleanup: %v", err)
+					continue
+				}
+
+				success = true
+				break
+			}
+
+			if !success {
+				log.Printf("Failed to process %s after retries: %v", work.sourceKey, lastErr)
+				logError(stats.errorLogFile, work.sourceKey, lastErr.Error())
+				stats.errCount.Add(1)
+			}
+
+			stats.processedObjects.Add(1)
+		}
+	}
+}
+
+func checkDatabase(db *sql.DB, config Config) {
+	rows, err := db.Query("SELECT sql FROM sqlite_master WHERE type='table' AND name='files'")
+	if err != nil {
+		log.Printf("Error checking table schema: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var tableSQL string
+		if err := rows.Scan(&tableSQL); err != nil {
+			log.Printf("Error reading table schema: %v", err)
+		} else {
+			debugLog(config, "Table schema: %s", tableSQL)
+		}
+	}
+
+	rows, err = db.Query("SELECT project_name, status, COUNT(*) FROM files GROUP BY project_name, status")
+	if err != nil {
+		log.Printf("Error getting file counts: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var projectName, status string
+		var count int
+		if err := rows.Scan(&projectName, &status, &count); err != nil {
+			log.Printf("Error reading count: %v", err)
+			continue
+		}
+		debugLog(config, "Project: %s, Status: %s, Count: %d", projectName, status, count)
+	}
+}
+
+func showProgress(stats *Stats, totalFiles int64) *progressbar.ProgressBar {
+	return progressbar.NewOptions64(
+		totalFiles,
+		progressbar.OptionSetDescription("Processing files..."),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionShowBytes(false),
+		progressbar.OptionSetWidth(15),
+		progressbar.OptionThrottle(100*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(os.Stderr, "\n")
+		}),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionFullWidth(),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionSetElapsedTime(true),
+		progressbar.OptionSetPredictTime(true),
+		progressbar.OptionShowElapsedTimeOnFinish(),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
 }
