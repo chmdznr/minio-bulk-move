@@ -51,15 +51,18 @@ type Stats struct {
 	successChan     chan string
 	startTime       time.Time
 	totalFiles      int64
+	lastError       atomic.Value
 }
 
 func NewStats(errorLogFile *os.File, totalFiles int64) *Stats {
-	return &Stats{
+	s := &Stats{
 		errorLogFile: errorLogFile,
 		successChan:  make(chan string, 100000),
 		startTime:    time.Now(),
 		totalFiles:   totalFiles,
 	}
+	s.lastError.Store("")
+	return s
 }
 
 func displayProgress(stats *Stats, bar *progressbar.ProgressBar) {
@@ -74,12 +77,18 @@ func displayProgress(stats *Stats, bar *progressbar.ProgressBar) {
 
 	percentage := float64(processed+errors) / float64(total) * 100
 
-	description := fmt.Sprintf("\rBatch Progress: %.1f%% | Processed: %d | Failed: %d | Speed: %.0f files/s | ETA: %v",
+	var lastError string
+	if stats.lastError.Load() != "" {
+		lastError = fmt.Sprintf(" | Last Error: %s", stats.lastError.Load())
+	}
+
+	description := fmt.Sprintf("\rProgress: %.1f%% | Success: %d | Failed: %d | Speed: %.0f/s | ETA: %v%s",
 		percentage,
 		processed,
 		errors,
 		speed,
-		eta.Round(time.Second))
+		eta.Round(time.Second),
+		lastError)
 
 	bar.Describe(description)
 	bar.Set64(processed + errors)
@@ -195,10 +204,12 @@ func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string
 }
 
 func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
-	ticker := time.NewTicker(1 * time.Second) // Process more frequently
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	var batch []string
+	batchSize := 1000 // Match the command line batch size
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -206,14 +217,16 @@ func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
 			if len(batch) > 0 {
 				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
 					log.Printf("Error marking final batch for cleanup: %v", err)
+					stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
 				}
 			}
 			return
 		case sourceKey := <-stats.successChan:
 			batch = append(batch, sourceKey)
-			if len(batch) >= 5000 { // Increase batch size to 5k
+			if len(batch) >= batchSize {
 				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
 					log.Printf("Error marking batch for cleanup: %v", err)
+					stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
 				}
 				batch = batch[:0]
 			}
@@ -221,6 +234,7 @@ func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
 			if len(batch) > 0 {
 				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
 					log.Printf("Error marking batch for cleanup: %v", err)
+					stats.lastError.Store(fmt.Sprintf("DB Error: %v", err))
 				}
 				batch = batch[:0]
 			}
@@ -248,6 +262,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 	})
 	if err != nil {
 		log.Printf("Error creating MinIO client in worker: %v", err)
+		stats.lastError.Store(fmt.Sprintf("MinIO Error: %v", err))
 		return
 	}
 
@@ -295,11 +310,13 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 						logError(stats.errorLogFile, work.sourceKey, "File does not exist in MinIO")
 						stats.errCount.Add(1)
 						stats.processedObjects.Add(1)
+						stats.lastError.Store(fmt.Sprintf("Not Found: %s", work.sourceKey))
 						success = true // Mark as success to avoid retries
 						break
 					}
 					lastErr = fmt.Errorf("error copying (took %v): %v", elapsed, err)
 					debugLog(config, "Copy error for %s: %v", work.sourceKey, err)
+					stats.lastError.Store(fmt.Sprintf("Copy Error: %v", err))
 					continue
 				}
 				debugLog(config, "Copy successful for %s (took %v)", work.sourceKey, elapsed)
@@ -309,6 +326,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				case stats.successChan <- work.sourceKey:
 				default:
 					log.Printf("Warning: success channel full, skipping database update for %s", work.sourceKey)
+					stats.lastError.Store("Warning: Database update queue full")
 				}
 
 				success = true
@@ -319,6 +337,7 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				log.Printf("Failed to process %s after retries: %v", work.sourceKey, lastErr)
 				logError(stats.errorLogFile, work.sourceKey, lastErr.Error())
 				stats.errCount.Add(1)
+				stats.lastError.Store(fmt.Sprintf("Failed: %v", lastErr))
 			}
 
 			stats.processedObjects.Add(1)
