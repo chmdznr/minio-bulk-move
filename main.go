@@ -54,7 +54,7 @@ type Stats struct {
 func NewStats(errorLogFile *os.File) *Stats {
 	return &Stats{
 		errorLogFile: errorLogFile,
-		successChan:  make(chan string, 10000),
+		successChan:  make(chan string, 100000), // Increase buffer size to 100k
 	}
 }
 
@@ -157,6 +157,11 @@ func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string
 	}
 	defer db.Close()
 
+	// Set busy timeout to avoid database locked errors
+	if _, err := db.Exec("PRAGMA busy_timeout = 10000"); err != nil {
+		return fmt.Errorf("error setting busy timeout: %v", err)
+	}
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("error starting transaction: %v", err)
@@ -187,7 +192,7 @@ func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string
 }
 
 func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(1 * time.Second) // Process more frequently
 	defer ticker.Stop()
 
 	var batch []string
@@ -203,7 +208,7 @@ func processDatabaseUpdates(ctx context.Context, stats *Stats, dbFile string) {
 			return
 		case sourceKey := <-stats.successChan:
 			batch = append(batch, sourceKey)
-			if len(batch) >= 1000 {
+			if len(batch) >= 5000 { // Increase batch size to 5k
 				if err := markFilesForCleanup(ctx, batch, dbFile); err != nil {
 					log.Printf("Error marking batch for cleanup: %v", err)
 				}
