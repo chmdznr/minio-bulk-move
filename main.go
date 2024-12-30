@@ -49,20 +49,24 @@ type Stats struct {
 	errCount        atomic.Int64
 	errorLogFile    *os.File
 	successChan     chan string
+	startTime       time.Time
+	totalFiles      int64
 }
 
-func NewStats(errorLogFile *os.File) *Stats {
+func NewStats(errorLogFile *os.File, totalFiles int64) *Stats {
 	return &Stats{
 		errorLogFile: errorLogFile,
-		successChan:  make(chan string, 100000), // Increase buffer size to 100k
+		successChan:  make(chan string, 100000),
+		startTime:    time.Now(),
+		totalFiles:   totalFiles,
 	}
 }
 
 func displayProgress(stats *Stats, bar *progressbar.ProgressBar) {
 	processed := stats.processedObjects.Load()
 	errors := stats.errCount.Load()
-	total := stats.processedObjects.Load() + errors
-	elapsed := time.Since(time.Now()).Seconds()
+	total := stats.totalFiles
+	elapsed := time.Since(stats.startTime).Seconds()
 	speed := float64(processed) / elapsed
 
 	remaining := total - processed - errors
@@ -70,8 +74,7 @@ func displayProgress(stats *Stats, bar *progressbar.ProgressBar) {
 
 	percentage := float64(processed+errors) / float64(total) * 100
 
-	description := fmt.Sprintf("\rBatch: %s | Progress: %.1f%% | Processed: %d | Failed: %d | Speed: %.0f files/s | ETA: %v",
-		"Batch",
+	description := fmt.Sprintf("\rBatch Progress: %.1f%% | Processed: %d | Failed: %d | Speed: %.0f files/s | ETA: %v",
 		percentage,
 		processed,
 		errors,
@@ -79,7 +82,7 @@ func displayProgress(stats *Stats, bar *progressbar.ProgressBar) {
 		eta.Round(time.Second))
 
 	bar.Describe(description)
-	bar.Set64(processed)
+	bar.Set64(processed + errors)
 }
 
 func createErrorLogFile(projectName string) (*os.File, error) {
@@ -410,33 +413,30 @@ func runMove(config Config) error {
 	debugLog(config, "MinIO client initialized successfully")
 
 	// Create error log file
-	errorLogFile, err := os.OpenFile("error.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	errorLogFile, err := createErrorLogFile(config.projectName)
 	if err != nil {
 		return fmt.Errorf("error creating error log file: %v", err)
 	}
 	defer errorLogFile.Close()
 
 	// Initialize stats
-	stats := NewStats(errorLogFile)
-
-	// Initialize context
-	ctx := context.Background()
-
-	// Initialize database
 	dbPool, err := initDB(config.dbFile)
 	if err != nil {
 		return fmt.Errorf("error initializing database: %v", err)
 	}
-	defer dbPool.Close()
-	debugLog(config, "Database initialized successfully")
-
-	// Get total count first
 	var totalCount int64
 	err = dbPool.QueryRow("SELECT COUNT(*) FROM files WHERE project_name = ? AND status = 'uploaded'", config.projectName).Scan(&totalCount)
 	if err != nil {
 		return fmt.Errorf("error getting total count: %v", err)
 	}
-	debugLog(config, "Found %d files to process", totalCount)
+	stats := NewStats(errorLogFile, totalCount)
+
+	// Initialize context
+	ctx := context.Background()
+
+	// Initialize database
+	defer dbPool.Close()
+	debugLog(config, "Database initialized successfully")
 
 	// Initialize work channel and wait group
 	workChan := make(chan FileOp, config.batchSize)
@@ -448,6 +448,21 @@ func runMove(config Config) error {
 
 	// Start database update processor
 	go processDatabaseUpdates(ctx, stats, config.dbFile)
+
+	// Start progress updater
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				displayProgress(stats, bar)
+			}
+		}
+	}()
 
 	// Start workers
 	debugLog(config, "Starting %d workers", config.workers)
@@ -505,15 +520,6 @@ func runCleanup(config Config) error {
 }
 
 func processFilesFromDB(ctx context.Context, db *sql.DB, config Config, workChan chan<- FileOp, stats *Stats) {
-	// Get total count first
-	var totalCount int64
-	err := db.QueryRow("SELECT COUNT(*) FROM files WHERE project_name = ? AND status = 'uploaded'", config.projectName).Scan(&totalCount)
-	if err != nil {
-		log.Printf("Error getting total count: %v", err)
-		return
-	}
-	stats.processedObjects.Store(totalCount)
-
 	offset := 0
 	for {
 		rows, err := db.QueryContext(ctx, `
@@ -586,7 +592,7 @@ func showProgress(stats *Stats, totalFiles int64) *progressbar.ProgressBar {
 		progressbar.OptionSetDescription("Processing files..."),
 		progressbar.OptionSetWriter(os.Stderr),
 		progressbar.OptionShowBytes(false),
-		progressbar.OptionSetWidth(15),
+		progressbar.OptionSetWidth(100),
 		progressbar.OptionThrottle(100*time.Millisecond),
 		progressbar.OptionShowCount(),
 		progressbar.OptionOnCompletion(func() {
@@ -595,16 +601,6 @@ func showProgress(stats *Stats, totalFiles int64) *progressbar.ProgressBar {
 		progressbar.OptionSpinnerType(14),
 		progressbar.OptionFullWidth(),
 		progressbar.OptionSetRenderBlankState(true),
-		progressbar.OptionSetElapsedTime(true),
-		progressbar.OptionSetPredictTime(true),
-		progressbar.OptionShowElapsedTimeOnFinish(),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "=",
-			SaucerHead:    ">",
-			SaucerPadding: " ",
-			BarStart:      "[",
-			BarEnd:        "]",
-		}),
 	)
 }
 
