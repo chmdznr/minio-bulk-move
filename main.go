@@ -273,12 +273,8 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 	}
 }
 
-func updateDatabase(ctx context.Context, successFiles []string, dbFile string) error {
-	if len(successFiles) == 0 {
-		return nil
-	}
-
-	log.Printf("Starting database update for %d files...", len(successFiles))
+func updateDatabase(ctx context.Context, successFiles []string, failedFiles []string, dbFile string) error {
+	log.Printf("Starting database update...")
 	startTime := time.Now()
 
 	db, err := sql.Open("sqlite3", dbFile)
@@ -299,37 +295,34 @@ func updateDatabase(ctx context.Context, successFiles []string, dbFile string) e
 		return fmt.Errorf("error setting database optimizations: %v", err)
 	}
 
-	// Update in batches of 1000
-	batchSize := 1000
-	totalBatches := (len(successFiles) + batchSize - 1) / batchSize
-	log.Printf("Processing %d batches of %d files each...", totalBatches, batchSize)
+	// First mark all files as pending_cleanup
+	log.Printf("Marking all files as pending_cleanup...")
+	updateStart := time.Now()
+	if _, err := db.ExecContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE 1=1"); err != nil {
+		return fmt.Errorf("error updating all files: %v", err)
+	}
+	log.Printf("Marked all files in %v", time.Since(updateStart))
 
-	for i := 0; i < len(successFiles); i += batchSize {
-		batchStart := time.Now()
-		end := i + batchSize
-		if end > len(successFiles) {
-			end = len(successFiles)
+	// If there are failed files, mark them back as uploaded
+	if len(failedFiles) > 0 {
+		log.Printf("Marking %d failed files as uploaded...", len(failedFiles))
+		updateStart = time.Now()
+
+		// Create placeholders for IN clause
+		placeholders := make([]string, len(failedFiles))
+		args := make([]interface{}, len(failedFiles))
+		for i, file := range failedFiles {
+			placeholders[i] = "?"
+			args[i] = path.Base(file)
 		}
 
-		// Create a batch query with multiple values
-		placeholders := make([]string, end-i)
-		args := make([]interface{}, end-i)
-		for j := 0; j < end-i; j++ {
-			placeholders[j] = "?"
-			args[j] = path.Base(successFiles[i+j])
-		}
-
-		query := fmt.Sprintf("UPDATE files SET status = 'pending_cleanup' WHERE id_file IN (%s)",
+		query := fmt.Sprintf("UPDATE files SET status = 'uploaded' WHERE id_file IN (%s)",
 			strings.Join(placeholders, ","))
 
-		// Execute the batch update
 		if _, err := db.ExecContext(ctx, query, args...); err != nil {
-			return fmt.Errorf("error updating batch: %v", err)
+			return fmt.Errorf("error marking failed files: %v", err)
 		}
-
-		batchTime := time.Since(batchStart)
-		progress := float64(end) / float64(len(successFiles)) * 100
-		log.Printf("Batch %d/%d (%.1f%%) completed in %v", (i/batchSize)+1, totalBatches, progress, batchTime)
+		log.Printf("Marked failed files in %v", time.Since(updateStart))
 	}
 
 	totalTime := time.Since(startTime)
@@ -441,7 +434,7 @@ func runMove(config Config) error {
 	log.Printf("Successful copies: %d", len(stats.successFiles))
 	log.Printf("Failed copies: %d", len(stats.failedFiles))
 
-	if err := updateDatabase(ctx, stats.successFiles, config.dbFile); err != nil {
+	if err := updateDatabase(ctx, stats.successFiles, stats.failedFiles, config.dbFile); err != nil {
 		return fmt.Errorf("error updating database: %v", err)
 	}
 
