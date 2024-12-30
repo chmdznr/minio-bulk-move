@@ -278,6 +278,9 @@ func updateDatabase(ctx context.Context, successFiles []string, dbFile string) e
 		return nil
 	}
 
+	log.Printf("Starting database update for %d files...", len(successFiles))
+	startTime := time.Now()
+
 	db, err := sql.Open("sqlite3", dbFile)
 	if err != nil {
 		return fmt.Errorf("error opening database: %v", err)
@@ -285,62 +288,67 @@ func updateDatabase(ctx context.Context, successFiles []string, dbFile string) e
 	defer db.Close()
 
 	// Set database optimizations
+	log.Printf("Setting database optimizations...")
 	if _, err := db.Exec(`
 		PRAGMA busy_timeout = 30000;
 		PRAGMA synchronous = NORMAL;
 		PRAGMA journal_mode = WAL;
 		PRAGMA temp_store = MEMORY;
+		PRAGMA cache_size = -2000000;
 	`); err != nil {
 		return fmt.Errorf("error setting database optimizations: %v", err)
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("error starting transaction: %v", err)
-	}
-
-	stmt, err := tx.PrepareContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?")
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("error preparing statement: %v", err)
-	}
-	defer stmt.Close()
-
 	// Update in batches of 1000
 	batchSize := 1000
+	totalBatches := (len(successFiles) + batchSize - 1) / batchSize
+	log.Printf("Processing %d batches of %d files each...", totalBatches, batchSize)
+
 	for i := 0; i < len(successFiles); i += batchSize {
+		batchStart := time.Now()
 		end := i + batchSize
 		if end > len(successFiles) {
 			end = len(successFiles)
 		}
 
+		// Start transaction for this batch
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("error starting transaction: %v", err)
+		}
+
+		// Prepare statement
+		stmt, err := tx.PrepareContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?")
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("error preparing statement: %v", err)
+		}
+
+		// Process each file in the batch
 		for _, sourceKey := range successFiles[i:end] {
 			idFile := path.Base(sourceKey)
 			if _, err := stmt.ExecContext(ctx, idFile); err != nil {
+				stmt.Close()
 				tx.Rollback()
 				return fmt.Errorf("error updating status for %s: %v", idFile, err)
 			}
 		}
 
-		// Commit each batch
+		// Close statement
+		stmt.Close()
+
+		// Commit transaction
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("error committing batch: %v", err)
 		}
 
-		// Start new transaction for next batch
-		if end < len(successFiles) {
-			tx, err = db.BeginTx(ctx, nil)
-			if err != nil {
-				return fmt.Errorf("error starting transaction: %v", err)
-			}
-			stmt, err = tx.PrepareContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?")
-			if err != nil {
-				tx.Rollback()
-				return fmt.Errorf("error preparing statement: %v", err)
-			}
-		}
+		batchTime := time.Since(batchStart)
+		progress := float64(end) / float64(len(successFiles)) * 100
+		log.Printf("Batch %d/%d (%.1f%%) completed in %v", (i/batchSize)+1, totalBatches, progress, batchTime)
 	}
 
+	totalTime := time.Since(startTime)
+	log.Printf("Database update completed in %v", totalTime)
 	return nil
 }
 
@@ -439,21 +447,32 @@ func runMove(config Config) error {
 	debugLog(config, "Waiting for workers to finish")
 	wg.Wait()
 
+	// Update progress one last time
+	displayProgress(stats, bar)
+
 	// Update database with successful files
+	log.Printf("\nCopy operations completed. Starting database updates...")
+	log.Printf("Total files processed: %d", stats.processedObjects.Load())
+	log.Printf("Successful copies: %d", len(stats.successFiles))
+	log.Printf("Failed copies: %d", len(stats.failedFiles))
+
 	if err := updateDatabase(ctx, stats.successFiles, config.dbFile); err != nil {
 		return fmt.Errorf("error updating database: %v", err)
 	}
 
 	// Log failed files
 	if len(stats.failedFiles) > 0 {
-		log.Printf("Failed to process %d files:", len(stats.failedFiles))
+		log.Printf("\nFailed to process %d files:", len(stats.failedFiles))
 		for _, file := range stats.failedFiles {
 			log.Printf("  - %s", file)
 		}
 	}
 
-	debugLog(config, "Move operation completed. Total: %d, Processed: %d, Errors: %d",
-		totalCount, stats.processedObjects.Load(), stats.errCount.Load())
+	log.Printf("\nMove operation completed successfully!")
+	log.Printf("Total files: %d", totalCount)
+	log.Printf("Processed: %d", stats.processedObjects.Load())
+	log.Printf("Errors: %d", stats.errCount.Load())
+	log.Printf("Total time: %v", time.Since(stats.startTime))
 
 	return nil
 }
