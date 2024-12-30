@@ -162,7 +162,7 @@ func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string
 		return fmt.Errorf("error starting transaction: %v", err)
 	}
 
-	stmt, err := tx.PrepareContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE path = ?")
+	stmt, err := tx.PrepareContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?")
 	if err != nil {
 		tx.Rollback()
 		return fmt.Errorf("error preparing statement: %v", err)
@@ -170,10 +170,12 @@ func markFilesForCleanup(ctx context.Context, sourceKeys []string, dbFile string
 	defer stmt.Close()
 
 	for _, sourceKey := range sourceKeys {
-		_, err = stmt.ExecContext(ctx, sourceKey)
+		// Extract id_file from the sourceKey (e.g., download/U-202304010000087809807 -> U-202304010000087809807)
+		idFile := path.Base(sourceKey)
+		_, err = stmt.ExecContext(ctx, idFile)
 		if err != nil {
 			tx.Rollback()
-			return fmt.Errorf("error updating status for %s: %v", sourceKey, err)
+			return fmt.Errorf("error updating status for %s: %v", idFile, err)
 		}
 	}
 
