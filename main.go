@@ -407,6 +407,21 @@ func runMove(config Config) error {
 	bar := showProgress(stats, totalCount)
 	defer bar.Close()
 
+	// Start progress updater
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				displayProgress(stats, bar)
+			}
+		}
+	}()
+
 	// Start workers
 	debugLog(config, "Starting %d workers", config.workers)
 	for i := 0; i < config.workers; i++ {
@@ -415,12 +430,12 @@ func runMove(config Config) error {
 	}
 
 	// Process files from database
-	debugLog(config, "Starting to process files from database")
-	processFilesFromDB(ctx, dbPool, config, workChan, stats)
-	debugLog(config, "Finished reading files from database")
+	go func() {
+		defer close(workChan)
+		processFilesFromDB(ctx, dbPool, config, workChan, stats)
+	}()
 
-	// Close work channel and wait for workers to finish
-	close(workChan)
+	// Wait for all workers to finish
 	debugLog(config, "Waiting for workers to finish")
 	wg.Wait()
 
