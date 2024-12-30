@@ -482,21 +482,6 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 
 			debugLog(config, "Processing file: %s -> %s", work.sourceKey, work.targetKey)
 
-			// Create a context with timeout for each operation
-			opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			_, err := minioClient.StatObject(opCtx, bucket, work.sourceKey, minio.StatObjectOptions{})
-			cancel()
-
-			if err != nil {
-				if strings.Contains(err.Error(), "The specified key does not exist") {
-					logError(stats.errorLogFile, work.sourceKey, "File does not exist in MinIO")
-					stats.errCount.Add(1)
-					stats.processedObjects.Add(1)
-					continue
-				}
-				debugLog(config, "StatObject error for %s: %v", work.sourceKey, err)
-			}
-
 			var lastErr error
 			success := false
 
@@ -526,6 +511,13 @@ func worker(ctx context.Context, client *minio.Client, bucket string, workChan <
 				cancel()
 
 				if err != nil {
+					if strings.Contains(err.Error(), "The specified key does not exist") {
+						logError(stats.errorLogFile, work.sourceKey, "File does not exist in MinIO")
+						stats.errCount.Add(1)
+						stats.processedObjects.Add(1)
+						success = true // Mark as success to avoid retries
+						break
+					}
 					lastErr = fmt.Errorf("error copying (took %v): %v", elapsed, err)
 					debugLog(config, "Copy error for %s: %v", work.sourceKey, err)
 					continue
