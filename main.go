@@ -291,10 +291,11 @@ func updateDatabase(ctx context.Context, successFiles []string, dbFile string) e
 	log.Printf("Setting database optimizations...")
 	if _, err := db.Exec(`
 		PRAGMA busy_timeout = 30000;
-		PRAGMA synchronous = NORMAL;
-		PRAGMA journal_mode = WAL;
+		PRAGMA synchronous = OFF;
+		PRAGMA journal_mode = MEMORY;
 		PRAGMA temp_store = MEMORY;
 		PRAGMA cache_size = -2000000;
+		PRAGMA locking_mode = EXCLUSIVE;
 	`); err != nil {
 		return fmt.Errorf("error setting database optimizations: %v", err)
 	}
@@ -311,35 +312,20 @@ func updateDatabase(ctx context.Context, successFiles []string, dbFile string) e
 			end = len(successFiles)
 		}
 
-		// Start transaction for this batch
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("error starting transaction: %v", err)
+		// Create a batch query with multiple values
+		placeholders := make([]string, end-i)
+		args := make([]interface{}, end-i)
+		for j := 0; j < end-i; j++ {
+			placeholders[j] = "?"
+			args[j] = path.Base(successFiles[i+j])
 		}
 
-		// Prepare statement
-		stmt, err := tx.PrepareContext(ctx, "UPDATE files SET status = 'pending_cleanup' WHERE id_file = ?")
-		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("error preparing statement: %v", err)
-		}
+		query := fmt.Sprintf("UPDATE files SET status = 'pending_cleanup' WHERE id_file IN (%s)",
+			strings.Join(placeholders, ","))
 
-		// Process each file in the batch
-		for _, sourceKey := range successFiles[i:end] {
-			idFile := path.Base(sourceKey)
-			if _, err := stmt.ExecContext(ctx, idFile); err != nil {
-				stmt.Close()
-				tx.Rollback()
-				return fmt.Errorf("error updating status for %s: %v", idFile, err)
-			}
-		}
-
-		// Close statement
-		stmt.Close()
-
-		// Commit transaction
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("error committing batch: %v", err)
+		// Execute the batch update
+		if _, err := db.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("error updating batch: %v", err)
 		}
 
 		batchTime := time.Since(batchStart)
